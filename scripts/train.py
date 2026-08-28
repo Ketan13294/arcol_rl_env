@@ -20,6 +20,19 @@ from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
 
+def _load_local_wandb_env() -> None:
+  env_path = Path(__file__).resolve().parent.parent / ".wandb.env"
+  if not env_path.exists():
+    return
+
+  for line in env_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+      continue
+    key, value = line.split("=", 1)
+    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
 @dataclass(frozen=True)
 class TrainConfig:
   env: ManagerBasedRlEnvCfg
@@ -193,6 +206,8 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
 
 
 def main():
+  _load_local_wandb_env()
+
   # Parse first argument to choose the task.
   # Import tasks to populate the registry.
   import mjlab.tasks  # noqa: F401

@@ -4,7 +4,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import tyro
@@ -39,6 +39,60 @@ class PlayConfig:
   _demo_mode: tyro.conf.Suppress[bool] = False
 
 
+def _ensure_wbc_lin_vel_z_command(env_cfg: Any) -> None:
+  """Ensure the flat WBC command exposes all four velocity commands.
+
+  The flat policy expects ``lin_vel_x``, ``lin_vel_y``, ``ang_vel_z`` and
+  ``lin_vel_z``.  Some play configurations only list the first three, which
+  makes the command vector differ from the one used by the policy.
+  """
+  commands = getattr(env_cfg, "commands", None)
+  if not isinstance(commands, dict) or "wbc" not in commands:
+    return
+
+  wbc_cmd = commands["wbc"]
+
+  required_commands = ("lin_vel_x", "lin_vel_y", "ang_vel_z", "lin_pos_z")
+
+  # Activate explicit flags when present.  Existing x/y/yaw settings are
+  # preserved; this primarily enables the missing vertical command.
+  for flag_name in (
+    "lin_vel_x",
+    "lin_vel_y",
+    "ang_vel_z",
+    "lin_pos_z",
+    "enable_lin_vel_z",
+    "command_lin_vel_z",
+  ):
+    if hasattr(wbc_cmd, flag_name):
+      flag_value = getattr(wbc_cmd, flag_name)
+      if isinstance(flag_value, bool):
+        setattr(wbc_cmd, flag_name, True)
+
+  # Ensure lin_vel_z appears in command name containers when present.
+  for names_attr in ("command_names", "commands"):
+    if hasattr(wbc_cmd, names_attr):
+      names = getattr(wbc_cmd, names_attr)
+      missing = [name for name in required_commands if name not in names]
+      if isinstance(names, list):
+        names.extend(missing)
+      elif isinstance(names, tuple):
+        setattr(wbc_cmd, names_attr, (*names, *missing))
+
+  # Validate we are commanding lin_vel_z in WBC config.
+  configured_names = set()
+  for names_attr in ("command_names", "commands"):
+    names = getattr(wbc_cmd, names_attr, ())
+    if isinstance(names, (list, tuple)):
+      configured_names.update(names)
+
+  if not all(name in configured_names for name in required_commands):
+    raise ValueError(
+      "WBC command config must include all four commands: "
+      f"{', '.join(required_commands)}."
+    )
+
+
 def run_play(task_id: str, cfg: PlayConfig):
   configure_torch_backends()
 
@@ -46,6 +100,8 @@ def run_play(task_id: str, cfg: PlayConfig):
 
   env_cfg = load_env_cfg(task_id, play=True)
   agent_cfg = load_rl_cfg(task_id)
+
+  _ensure_wbc_lin_vel_z_command(env_cfg)
 
   DUMMY_MODE = cfg.agent in {"zero", "random"}
   TRAINED_MODE = not DUMMY_MODE

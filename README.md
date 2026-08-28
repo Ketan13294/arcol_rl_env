@@ -24,6 +24,19 @@ and sim-to-real deployment.
 
 Please refer to [setup.md](doc/setup_en.md) for installation and configuration steps.
 
+### Weights & Biases Logging
+
+W&B logging is enabled by the RSL-RL runner. Install the project with `pip install -e .`,
+then use the repo-local credential file for training:
+
+```bash
+cp .wandb.env.example .wandb.env
+# Set WANDB_API_KEY in .wandb.env
+python scripts/train.py Unitree-G1-Flat --env.scene.num-envs=4096
+```
+
+The `.wandb.env` file is ignored by Git and is loaded automatically by `scripts/train.py`.
+
 
 ## 🔁 Process Overview
 
