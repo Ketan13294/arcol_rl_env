@@ -7,4 +7,5 @@ sudo sysctl -w kernel.numa_balancing=0
 
 python -c 'import warp as wp; wp.init(); wp.set_device("cuda:0")'
 
-python ../scripts/train.py Unitree-G1-Flat-WBC --env.scene.num-envs=7096
+python scripts/train.py Unitree-G1-Flat-WBC --env.scene.num-envs=4096 
+#--agent.resume=True --agent.load_run=2026-08-31_17-59-52 --agent.load_checkpoint=model_2000.pt
