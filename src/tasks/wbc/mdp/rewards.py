@@ -191,7 +191,7 @@ def undesired_stepping(
   commands = env.command_manager.get_command(command_name)
 
   # Penalize stepping when the command is near zero.
-  mask = torch.sum(torch.abs(commands[:, :3]),dim=-1) < command_threshold
+  mask = torch.norm(torch.abs(commands[:, :3]),dim=-1) < command_threshold
   penalty = no_contact * mask
   return penalty
 
@@ -493,12 +493,12 @@ def stand_still(
     if command_name is not None:
         command = env.command_manager.get_command(command_name)
         if command is not None:
-            # linear_norm = torch.norm(command[:, :2], dim=1)
+            linear_norm = torch.norm(command[:, :2], dim=1)
             z_norm = torch.abs(command[:, 3])
-            # angular_norm = torch.abs(command[:, 2])
-            # total_command = linear_norm + angular_norm
+            angular_norm = torch.abs(command[:, 2])
+            total_command = linear_norm + angular_norm
             # scale = (total_command <= command_threshold).float()
-            scale = ((torch.norm(command[:, :3], dim=-1) <= command_threshold) & (z_norm <= command_threshold)).float()
+            scale = ((total_command <= command_threshold) & (z_norm <= command_threshold)).float()
             reward *= scale
     return reward
 
