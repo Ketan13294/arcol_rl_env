@@ -117,6 +117,10 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       func=mdp.foot_contact_forces,
       params={"sensor_name": "feet_ground_contact"},
     ),
+    # "base_height": ObservationTermCfg(
+    #   func=mdp.base_height,
+    #   params={"asset_cfg": SceneEntityCfg("robot", site_names=())},  # Set per-robot.
+    # ),
   }
 
   observations = {
@@ -177,8 +181,8 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     "twist": UniformVelocityCommandCfg(
       entity_name="robot",
       resampling_time_range=(3.0, 8.0),
-      rel_standing_envs=0.05,
-      rel_height_envs=0.05,
+      rel_standing_envs=0.08,
+      rel_height_envs=0.1,
       heading_command=False,
       heading_control_stiffness=0.5,
       debug_vis=True,
@@ -190,7 +194,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
         ang_vel_z=(-1.0, 1.0),
         lin_vel_z=(-0.5,0.5),
         # heading=(-math.pi, math.pi),
-        lin_pos_z=(0.5, 0.78),
+        lin_pos_z=(0.5, 0.76),
       ),
     )
   }
@@ -288,7 +292,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     "track_linear_velocity": RewardTermCfg(
       func=mdp.track_linear_velocity,
       weight=1.5,
-      params={"command_name": "twist", "std": math.sqrt(0.5)},
+      params={"command_name": "twist", "std": math.sqrt(0.25), "include_z": False},
     ),
     "track_linear_velocity_z": RewardTermCfg(
       func=mdp.track_linear_velocity_z,
@@ -297,17 +301,20 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "track_angular_velocity": RewardTermCfg(
       func=mdp.track_angular_velocity,
-      weight=1.0,
-      params={"command_name": "twist", "std": math.sqrt(0.3)},
+      # weight=1.5,
+      # params={"command_name": "twist", "std": math.sqrt(0.25)},
+      weight=1.5,
+      params={"command_name": "twist", "std": math.sqrt(0.25)},
     ),
     "undesired_velocity": RewardTermCfg(
       func=mdp.undesired_velocity,
-      weight=-0.15,
+      weight=-1.0,
       params={"command_name": "twist", "command_threshold": 0.1},
     ),
     "undesired_stepping": RewardTermCfg(
       func=mdp.undesired_stepping,
-      weight=-0.95,
+      weight=-2.5,
+      # weight=-0.5,
       params={"sensor_name": "feet_ground_contact", "command_name": "twist", "command_threshold": 0.1},
     ),
     "body_orientation_l2": RewardTermCfg(
@@ -325,6 +332,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
         "std_height": {},   # Set per-robot.
         "std_walking": {},  # Set per-robot.
         "std_running": {},  # Set per-robot.
+        "height_threshold": 0.1,
         "walking_threshold": 0.1,
         "running_threshold": 1.5,
       },
@@ -360,6 +368,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       weight=-1.0,
       params={
         "target_height": 0.12,
+        # "target_height": 0.10,
         "command_name": "twist",
         "command_threshold": 0.1,
         "asset_cfg": SceneEntityCfg("robot", site_names=()),  # Set per-robot.
@@ -373,7 +382,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     #     "sensor_name": "feet_ground_contact",
     #     "target_height": 0.1,
     #     "command_name": "twist",
-    #     "command_threshold": 0.05,
+    #     "command_threshold": 0.1,
     #     "asset_cfg": SceneEntityCfg("robot", site_names=()),  # Set per-robot.
     #   },
     # ),
@@ -390,6 +399,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     "soft_landing": RewardTermCfg(
       func=mdp.soft_landing,
       weight=-1e-2,
+      # weight=-1e-3,
       params={
         "sensor_name": "feet_ground_contact",
         "command_name": "twist",
@@ -398,7 +408,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "stand_still": RewardTermCfg(
       func=mdp.stand_still,
-      weight=-1.0,
+      weight=-0.5,
       params={
         "command_name": "twist",
         "command_threshold": 0.1,
@@ -407,7 +417,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "stand_still_upper": RewardTermCfg(
       func=mdp.stand_still_upper,
-      weight=-0.75,
+      weight=-0.5,
       params={
         "command_name": "twist",
         "command_threshold": 0.1,
@@ -494,8 +504,8 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       njmax=1500,
       mujoco=MujocoCfg(
         timestep=0.005,
-        iterations=10,
-        ls_iterations=20,
+        iterations=6,
+        ls_iterations=10,
       ),
     ),
     decimation=4,

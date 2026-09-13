@@ -36,10 +36,10 @@ def track_linear_velocity(
   assert command is not None, f"Command '{command_name}' not found."
   actual = asset.data.root_link_lin_vel_b
   xy_error = torch.sum(torch.square(command[:, :2] - actual[:, :2]), dim=1)
-  z_error = torch.square(command[:, 3] - actual[:, 2])
+  z_error = torch.square(command[:, 3] - asset.data.root_link_lin_vel_w[:, 2])
   lin_vel_error = xy_error
   if include_z:
-    lin_vel_error += 2*z_error
+    lin_vel_error += 2.0 * z_error
   return torch.exp(-lin_vel_error / std**2)
 
 def track_linear_velocity_z(
@@ -55,7 +55,7 @@ def track_linear_velocity_z(
   assert command is not None, f"Command '{command_name}' not found."
   actual = asset.data.root_link_lin_vel_w
   lin_vel_error = torch.square(command[:, 3] - actual[:, 2])
-  return torch.exp(-lin_vel_error / std**2)
+  return torch.exp(-lin_vel_error / std**2) - 3.0 * torch.abs(actual[:, 2]) * (torch.abs(command[:, 3]) < 0.1).float()
 
 
 def track_angular_velocity(
@@ -160,22 +160,20 @@ def undesired_velocity(
   vel = asset.data.root_link_lin_vel_b[:, :]
   yaw_vel = asset.data.root_link_ang_vel_b[:, 2]
   vel_w = asset.data.root_link_lin_vel_w[:,:]
+  actuals = torch.cat([vel, yaw_vel.unsqueeze(-1)], dim=-1)
 
   commands = env.command_manager.get_command(command_name)
   if commands is None:
     return torch.zeros(env.num_envs, device=env.device)
   
   # Penalize residual x/y velocity and yaw rate when their commands are near zero.
-  xy_yaw_mask = (torch.norm(commands[:, :3], dim=-1) < command_threshold)
-  xy_yaw_penalty = torch.norm(torch.concat([vel[:, :2], yaw_vel.unsqueeze(-1)], dim=-1), dim=-1) * xy_yaw_mask
+  xy_yaw_mask = ((torch.norm(commands[:, :2], dim=-1) + torch.abs(commands[:, 2])) < command_threshold).float()
+  xy_yaw_penalty = torch.norm(commands[:, :3] - actuals[:, :3], dim=-1) * xy_yaw_mask
 
-  z_mask = (torch.abs(commands[:, 3]) < command_threshold)
-  z_penalty = torch.abs(vel_w[:, 2]) * z_mask
+  z_mask = (torch.abs(commands[:, 3]) < command_threshold).float()
+  z_penalty = torch.abs(commands[:,3] - vel_w[:, 2]) * z_mask
 
-  # yaw_mask = (torch.abs(commands[:, 2]) < command_threshold)
-  # yaw_penalty = (torch.abs(yaw_vel) * yaw_mask)
-
-  return 2*xy_yaw_penalty + z_penalty
+  return xy_yaw_penalty + 4.0 * z_penalty
 
 def undesired_stepping(
   env: ManagerBasedRlEnv,
@@ -191,7 +189,7 @@ def undesired_stepping(
   commands = env.command_manager.get_command(command_name)
 
   # Penalize stepping when the command is near zero.
-  mask = torch.norm(torch.abs(commands[:, :3]),dim=-1) < command_threshold
+  mask = ((torch.norm(commands[:, :2],dim=-1) + torch.abs(commands[:, 2])) < command_threshold).float()
   penalty = no_contact * mask
   return penalty
 
@@ -447,6 +445,7 @@ class variable_posture:
     std_running,
     asset_cfg: SceneEntityCfg,
     command_name: str,
+    height_threshold: float = 0.1,
     walking_threshold: float = 0.5,
     running_threshold: float = 1.5,
   ) -> torch.Tensor:
@@ -462,7 +461,7 @@ class variable_posture:
     total_speed = linear_speed + angular_speed
 
     standing_mask = (total_speed < walking_threshold).float()
-    height_mask = ((total_speed < walking_threshold) & (height_speed > 0.05)).float()
+    height_mask = ((height_speed > height_threshold) & (total_speed < walking_threshold)).float()
     walking_mask = (
       (total_speed >= walking_threshold) & (total_speed < running_threshold)
     ).float()
@@ -493,9 +492,9 @@ def stand_still(
     if command_name is not None:
         command = env.command_manager.get_command(command_name)
         if command is not None:
-            linear_norm = torch.norm(command[:, :2], dim=1)
-            z_norm = torch.abs(command[:, 3])
+            linear_norm = torch.norm(command[:, :2], dim=-1)
             angular_norm = torch.abs(command[:, 2])
+            z_norm = torch.abs(command[:, 3])
             total_command = linear_norm + angular_norm
             # scale = (total_command <= command_threshold).float()
             scale = ((total_command <= command_threshold) & (z_norm <= command_threshold)).float()
@@ -511,13 +510,4 @@ def stand_still_upper(
     asset: Entity = env.scene[asset_cfg.name]
     diff_angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
     reward = torch.sum(torch.square(diff_angle), dim=1)
-    # if command_name is not None:
-    #     command = env.command_manager.get_command(command_name)
-    #     if command is not None:
-    #         # linear_norm = torch.norm(command[:, :2], dim=1)
-    #         # angular_norm = torch.abs(command[:, 2])
-    #         z_norm = torch.abs(command[:, 3])
-    #         # total_command = linear_norm + angular_norm
-    #         # scale = (torch.norm(command[:, :3], dim=1) <= command_threshold) and (z_norm > command_threshold).float()
-    #         # reward *= scale
     return reward

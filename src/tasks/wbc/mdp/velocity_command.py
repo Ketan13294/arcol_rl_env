@@ -94,6 +94,7 @@ class UniformVelocityCommand(CommandTerm):
     # Keep the vertical command in world frame; x/y and yaw are body-frame.
     self.vel_command_b[env_ids, 3] = r.uniform_(*self.cfg.ranges.lin_vel_z)
 
+    # Near-zero subsampling: increases command density near zero for each dimension.
     if self.cfg.ranges.lin_vel_x[0] < -0.2:
       num_red_envs_down = max(1, int(0.1 * len(env_ids)))
       red_env_ids_down = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_down]]
@@ -134,8 +135,12 @@ class UniformVelocityCommand(CommandTerm):
       red_env_ids_up = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_up]]
       self.vel_command_b[red_env_ids_up, 3] = torch.zeros(len(red_env_ids_up), device=self.device).uniform_(0, 0.1)
 
-    self.vel_command_b[env_ids, :] *= (torch.norm(self.vel_command_b[env_ids, :3], dim=1) > 0.05).unsqueeze(1)
-
+    # Norm gate: zeros all dims (incl. Z) when xy+yaw norm < 0.05 — couples Z to XY/yaw.
+    lin_vel_norm = torch.norm(self.vel_command_b[env_ids, :2], dim=-1)
+    ang_vel_abs = torch.abs(self.vel_command_b[env_ids, 2])
+    lin_vel_z_abs = torch.abs(self.vel_command_b[env_ids, 3])
+    total_command = lin_vel_norm + ang_vel_abs
+    self.vel_command_b[env_ids, :3] *= (total_command > 0.1).unsqueeze(1)
 
     if self.cfg.height_command:
       assert self.cfg.ranges.lin_pos_z is not None
@@ -147,6 +152,7 @@ class UniformVelocityCommand(CommandTerm):
       self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
       self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
     self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
+    self.vel_command_b[env_ids,  3:4] *= (lin_vel_z_abs > 0.1).unsqueeze(1)
 
     init_vel_mask = r.uniform_(0.0, 1.0) < self.cfg.init_velocity_prob
     init_vel_env_ids = env_ids[init_vel_mask]
@@ -250,7 +256,7 @@ class UniformVelocityCommand(CommandTerm):
           min=ranges.lin_pos_z[0],
           max=ranges.lin_pos_z[1],
           step=0.01,
-          initial_value=0.782,
+          initial_value=0.762,
         )
 
       zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
@@ -260,7 +266,7 @@ class UniformVelocityCommand(CommandTerm):
         for s in sliders:
           s.value = 0.0
         if height_slider is not None and ranges.lin_pos_z is not None:
-          height_slider.value = 0.782
+          height_slider.value = 0.762
 
       enable_posZ_btn = server.gui.add_button("Enable Z position:", icon=Icon.SQUARE_X)
 

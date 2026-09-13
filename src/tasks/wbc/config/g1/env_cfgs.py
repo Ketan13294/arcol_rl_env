@@ -93,10 +93,10 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["pose"].params["std_standing"] = {".*": 0.05}
   cfg.rewards["pose"].params["std_height"] = {
     # Lower body.
-    r".*hip_pitch.*": 0.1,
+    r".*hip_pitch.*": 0.5,
     r".*hip_roll.*": 0.05,
     r".*hip_yaw.*": 0.05,
-    r".*knee.*": 0.1,
+    r".*knee.*": 0.5,
     r".*ankle_pitch.*": 0.15,
     r".*ankle_roll.*": 0.05,
     # Waist.
@@ -189,9 +189,9 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = unitree_g1_rough_env_cfg(play=play)
 
   cfg.sim.njmax = 300
-  cfg.sim.mujoco.ccd_iterations = 50
+  cfg.sim.mujoco.ccd_iterations = 0
   cfg.sim.contact_sensor_maxmatch = 64
-  cfg.sim.nconmax = None
+  cfg.sim.nconmax = 32
 
   # Switch to flat terrain.
   assert cfg.scene.terrain is not None
