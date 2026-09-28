@@ -14,6 +14,6 @@ taskset -c 5-9 python scripts/train.py Unitree-G1-Flat-WBC \
   --env.scene.num-envs=4096 \
   --agent.resume=True \
   --agent.load_run=2026-08-29_20-12-33 \
-  --agent.load_checkpoint=model_12000.pt
+  --agent.load_checkpoint=model_12000.pt \
+  --agent.run_name=addedheightMovementPenalty \
 
-# --agent.run_name=addedheightMovementPenalty_5 \

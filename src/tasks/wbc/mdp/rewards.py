@@ -160,7 +160,7 @@ def undesired_velocity(
   vel = asset.data.root_link_lin_vel_b[:, :]
   yaw_vel = asset.data.root_link_ang_vel_b[:, 2]
   vel_w = asset.data.root_link_lin_vel_w[:,:]
-  actuals = torch.cat([vel, yaw_vel.unsqueeze(-1)], dim=-1)
+  actuals = torch.cat([vel[:, :2], yaw_vel.unsqueeze(-1)], dim=-1)
 
   commands = env.command_manager.get_command(command_name)
   if commands is None:

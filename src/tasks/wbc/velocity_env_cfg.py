@@ -182,7 +182,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       entity_name="robot",
       resampling_time_range=(3.0, 8.0),
       rel_standing_envs=0.08,
-      rel_height_envs=0.1,
+      rel_height_envs=1.0,
       heading_command=False,
       heading_control_stiffness=0.5,
       debug_vis=True,
