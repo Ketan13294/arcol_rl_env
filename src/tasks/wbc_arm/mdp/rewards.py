@@ -8,7 +8,7 @@ from mjlab.entity import Entity
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply_inverse, yaw_quat
 from mjlab.utils.lab_api.string import (
   resolve_matching_names_values,
 )
@@ -18,6 +18,20 @@ if TYPE_CHECKING:
 
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+_CONTACT_FORCE_THRESHOLD = 50.0  # N; shared by every foot-contact decision.
+
+
+def _lin_vel_heading(asset: Entity) -> torch.Tensor:
+  """Root linear velocity in the gravity-aligned heading frame (z is world z)."""
+  return quat_apply_inverse(
+    yaw_quat(asset.data.root_link_quat_w), asset.data.root_link_lin_vel_w
+  )
+
+
+def _feet_in_contact(sensor: ContactSensor, force_threshold: float) -> torch.Tensor:
+  """Force-based foot contact [B, N]: a foot is planted when it carries > threshold."""
+  assert sensor.data.force is not None
+  return torch.norm(sensor.data.force, dim=-1) > force_threshold
 
 
 def track_linear_velocity(
@@ -34,7 +48,7 @@ def track_linear_velocity(
   asset: Entity = env.scene[asset_cfg.name]
   command = env.command_manager.get_command(command_name)
   assert command is not None, f"Command '{command_name}' not found."
-  actual = asset.data.root_link_lin_vel_b
+  actual = _lin_vel_heading(asset)
   xy_error = torch.sum(torch.square(command[:, :2] - actual[:, :2]), dim=1)
   z_error = torch.square(command[:, 3] - asset.data.root_link_lin_vel_w[:, 2])
   lin_vel_error = xy_error
@@ -55,7 +69,7 @@ def track_linear_velocity_z(
   assert command is not None, f"Command '{command_name}' not found."
   actual = asset.data.root_link_lin_vel_w
   lin_vel_error = torch.square(command[:, 3] - actual[:, 2])
-  return torch.exp(-lin_vel_error / std**2) - 3.0 * torch.abs(actual[:, 2]) * (torch.abs(command[:, 3]) < 0.1).float()
+  return torch.exp(-lin_vel_error / std**2)
 
 
 def track_angular_velocity(
@@ -157,35 +171,38 @@ def undesired_velocity(
 ) -> torch.Tensor:
   """Penalize undesired velocity components when command is zero."""
   asset: Entity = env.scene[asset_cfg.name]
-  vel = asset.data.root_link_lin_vel_b[:, :]
+  vel = _lin_vel_heading(asset)
   yaw_vel = asset.data.root_link_ang_vel_b[:, 2]
   vel_w = asset.data.root_link_lin_vel_w[:,:]
-  actuals = torch.cat([vel, yaw_vel.unsqueeze(-1)], dim=-1)
+  actuals = torch.cat([vel[:, :2], yaw_vel.unsqueeze(-1)], dim=-1)
 
   commands = env.command_manager.get_command(command_name)
   if commands is None:
     return torch.zeros(env.num_envs, device=env.device)
   
   # Penalize residual x/y velocity and yaw rate when their commands are near zero.
+  # Restored from run 2026-08-29_20-12-33: z is penalized 1x (not 4x) so the
+  # height P-controller's small commands near the target are not over-penalized.
+  # Frames: xy in the heading frame, yaw rate in body frame, z in world frame.
   xy_yaw_mask = ((torch.norm(commands[:, :2], dim=-1) + torch.abs(commands[:, 2])) < command_threshold).float()
-  xy_yaw_penalty = torch.norm(commands[:, :3] - actuals[:, :3], dim=-1) * xy_yaw_mask
+  xy_yaw_penalty = torch.norm(actuals[:, :3], dim=-1) * xy_yaw_mask
 
   z_mask = (torch.abs(commands[:, 3]) < command_threshold).float()
-  z_penalty = torch.abs(commands[:,3] - vel_w[:, 2]) * z_mask
+  z_penalty = torch.abs(vel_w[:, 2]) * z_mask
 
-  return xy_yaw_penalty + 4.0 * z_penalty
+  return 2.0 * xy_yaw_penalty + z_penalty
 
 def undesired_stepping(
   env: ManagerBasedRlEnv,
   sensor_name: str,
   command_name: str,
   command_threshold: float = 0.1,
+  contact_force_threshold: float = _CONTACT_FORCE_THRESHOLD,
 ) -> torch.Tensor:
   """Penalize undesired stepping behavior."""
   sensor: ContactSensor = env.scene[sensor_name]
-  sensor_data = sensor.data
 
-  no_contact = torch.sum(torch.norm(sensor_data.force[:,:,:],dim=-1) < 50.0,dim=-1)
+  no_contact = torch.sum(~_feet_in_contact(sensor, contact_force_threshold), dim=-1)
   commands = env.command_manager.get_command(command_name)
 
   # Penalize stepping when the command is near zero.
@@ -256,9 +273,10 @@ def feet_gait(
         command_threshold: float,
         command_name: str,
         sensor_name: str,
+        contact_force_threshold: float = _CONTACT_FORCE_THRESHOLD,
 ) -> torch.Tensor:
     sensor: ContactSensor = env.scene[sensor_name]
-    is_contact = sensor.data.current_contact_time > 0
+    is_contact = _feet_in_contact(sensor, contact_force_threshold)
     global_phase = ((env.episode_length_buf * env.step_dt) / period).unsqueeze(1)
     offsets = torch.as_tensor(offset, device=env.device, dtype=global_phase.dtype).view(1, -1)
     leg_phase = (global_phase + offsets) % 1.0
@@ -270,8 +288,11 @@ def feet_gait(
             linear_norm = torch.norm(command[:, :2], dim=1)
             angular_norm = torch.abs(command[:, 2])
             total_command = linear_norm + angular_norm
-            scale = (total_command > command_threshold).float()
-            reward *= scale
+            active = total_command > command_threshold
+            # Below the xy/yaw threshold (standing or height-only commands) the
+            # desired gait is double stance: reward feet in contact, not the clock.
+            stand_reward = is_contact.float().mean(dim=1)
+            reward = torch.where(active, reward, stand_reward)
     return reward
 
 
@@ -334,15 +355,15 @@ def feet_slip(
   command_threshold: float = 0.01,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """Penalize foot sliding (xy velocity while in contact)."""
+  """Penalize foot sliding (xy velocity while in contact).
+
+  Always active: feet in contact must not slide while walking, standing or
+  changing height. The command args are kept for config compatibility.
+  """
+  del command_name, command_threshold  # Unused.
   asset: Entity = env.scene[asset_cfg.name]
   contact_sensor: ContactSensor = env.scene[sensor_name]
-  command = env.command_manager.get_command(command_name)
-  assert command is not None
-  linear_norm = torch.norm(command[:, :2], dim=1)
-  angular_norm = torch.abs(command[:, 2])
-  total_command = linear_norm + angular_norm
-  active = (total_command > command_threshold).float()
+  active = 1.0
   assert contact_sensor.data.found is not None
   in_contact = (contact_sensor.data.found > 0).float()  # [B, N]
   foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]  # [B, N, 2]
@@ -460,8 +481,9 @@ class variable_posture:
     height_speed = torch.abs(command[:, 3])
     total_speed = linear_speed + angular_speed
 
-    standing_mask = (total_speed < walking_threshold).float()
+    # Mutually exclusive regimes: standing, height change, walking, running.
     height_mask = ((height_speed > height_threshold) & (total_speed < walking_threshold)).float()
+    standing_mask = ((height_speed <= height_threshold) & (total_speed < walking_threshold)).float()
     walking_mask = (
       (total_speed >= walking_threshold) & (total_speed < running_threshold)
     ).float()
@@ -512,99 +534,89 @@ def stand_still_upper(
     reward = torch.sum(torch.square(diff_angle), dim=1)
     return reward
 
-import torch
-from mjlab.envs import ManagerBasedRlEnv
 
-# 1. Arm Action Rate Penalty
+##
+# Arm command rewards.
+##
+
+
+def track_arm_joint_pos(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+) -> torch.Tensor:
+  """Reward tracking of the commanded arm joint position reference."""
+  command_term = env.command_manager.get_term(command_name)
+  asset: Entity = command_term.robot
+  if command_term.num_arm_joints == 0:
+    return torch.zeros(env.num_envs, device=env.device)
+  current_q = asset.data.joint_pos[:, command_term.arm_joint_ids]
+  error_sq = torch.mean(torch.square(current_q - command_term.arm_command), dim=-1)
+  return torch.exp(-error_sq / std**2)
+
+
+# Action-space terms index actions by actuator id; this assumes the joint position
+# action term spans all robot actuators (actuator_names=(".*",)) in entity order.
 def arm_action_rate_penalty(
-    env: ManagerBasedRlEnv, 
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize rapid changes in arm control actions to enforce smooth trajectories."""
-    current_action = env.action_manager.action[:, asset_cfg.joint_ids]
-    prev_action = env.action_manager.prev_action[:, asset_cfg.joint_ids]
-    return torch.sum(torch.square(current_action - prev_action), dim=-1)
+  """Penalize rapid changes in arm control actions to enforce smooth trajectories."""
+  current_action = env.action_manager.action[:, asset_cfg.actuator_ids]
+  prev_action = env.action_manager.prev_action[:, asset_cfg.actuator_ids]
+  return torch.sum(torch.square(current_action - prev_action), dim=-1)
 
 
-# 2. Arm Action Acceleration (Second-Order Smoothness)
 def arm_action_acc_penalty(
-    env: ManagerBasedRlEnv, 
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize arm action acceleration (jerk/jitter) for clean motor execution."""
-    curr_action = env.action_manager.action[:, asset_cfg.joint_ids]
-    prev_action = env.action_manager.prev_action[:, asset_cfg.joint_ids]
-    prev2_action = env.action_manager.prev_prev_action[:, asset_cfg.joint_ids]
-    
-    action_acc = curr_action - 2.0 * prev_action + prev2_action
-    return torch.sum(torch.square(action_acc), dim=-1)
+  """Penalize arm action second differences (jerk/jitter) for clean motor execution."""
+  curr_action = env.action_manager.action[:, asset_cfg.actuator_ids]
+  prev_action = env.action_manager.prev_action[:, asset_cfg.actuator_ids]
+  prev2_action = env.action_manager.prev_prev_action[:, asset_cfg.actuator_ids]
+  action_acc = curr_action - 2.0 * prev_action + prev2_action
+  return torch.sum(torch.square(action_acc), dim=-1)
 
 
-# 3. Arm Joint Velocity Damping Penalty
 def arm_joint_vel_penalty(
-    env: ManagerBasedRlEnv, 
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize high arm joint velocities to suppress aggressive or wild swings."""
-    arm_vel = env.scene["robot"].data.joint_vel[:, asset_cfg.joint_ids]
-    return torch.sum(torch.square(arm_vel), dim=-1)
+  """Penalize high arm joint velocities to suppress aggressive or wild swings."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=-1)
 
 
-# 4. Arm Joint Acceleration Penalty
 def arm_joint_acc_penalty(
-    env: ManagerBasedRlEnv, 
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize high joint acceleration to reduce mechanical strain on wrist/elbow motors."""
-    arm_acc = env.scene["robot"].data.joint_acc[:, asset_cfg.joint_ids]
-    return torch.sum(torch.square(arm_acc), dim=-1)
+  """Penalize high arm joint accelerations to reduce strain on wrist/elbow motors."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return torch.sum(torch.square(asset.data.joint_acc[:, asset_cfg.joint_ids]), dim=-1)
 
 
-# 5. Arm Joint Torque / Energy Minimization Penalty
 def arm_torque_penalty(
-    env: ManagerBasedRlEnv, 
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize high motor torque output on arm joints to prevent overheating."""
-    arm_torques = env.scene["robot"].data.applied_torque[:, asset_cfg.joint_ids]
-    return torch.sum(torch.square(arm_torques), dim=-1)
+  """Penalize arm actuator forces to limit motor heating."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return torch.sum(torch.square(asset.data.actuator_force[:, asset_cfg.actuator_ids]), dim=-1)
 
 
-# 6. Safe Soft Joint Limit Penalty
 def arm_joint_limits_penalty(
-    env: ManagerBasedRlEnv, 
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-    threshold: float = 0.85
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  threshold: float = 0.85,
 ) -> torch.Tensor:
-    """Penalize arm joint positions that exceed 85% of their allowable range."""
-    current_q = env.scene["robot"].data.joint_pos[:, asset_cfg.joint_ids]
-    
-    # Fetch original joint limits from physics model
-    q_min = torch.tensor(env.sim.model.jnt_range[asset_cfg.joint_ids, 0], device=env.device)
-    q_max = torch.tensor(env.sim.model.jnt_range[asset_cfg.joint_ids, 1], device=env.device)
-    
-    q_center = (q_max + q_min) / 2.0
-    q_half_range = (q_max - q_min) / 2.0
-    
-    # Compute normalized position in [-1, 1] relative to center
-    normalized_pos = torch.abs((current_q - q_center) / q_half_range)
-    
-    # Penalize only when exceeding the threshold (e.g., 0.85 of limit)
-    out_of_bounds = torch.clamp(normalized_pos - threshold, min=0.0)
-    return torch.sum(torch.square(out_of_bounds), dim=-1)
-
-
-# 7. Arm-Torso Self-Collision / Proximity Penalty
-def arm_torso_distance_penalty(
-    env: ManagerBasedRlEnv,
-    arm_site_names: list,
-    min_dist: float = 0.10
-) -> torch.Tensor:
-    """Penalize arm links getting closer than min_dist (e.g. 10cm) to the torso body."""
-    # Read position of hand/elbow sites relative to torso root
-    arm_positions = env.scene.get_site_positions(arm_site_names) # (N, num_sites, 3)
-    torso_pos = env.scene["robot"].data.root_pos_w.unsqueeze(1)    # (N, 1, 3)
-    
-    distances = torch.norm(arm_positions - torso_pos, dim=-1)      # (N, num_sites)
-    too_close = torch.clamp(min_dist - distances, min=0.0)
-    return torch.sum(torch.square(too_close), dim=-1)
+  """Penalize arm joint positions beyond `threshold` of their half-range from center."""
+  asset: Entity = env.scene[asset_cfg.name]
+  current_q = asset.data.joint_pos[:, asset_cfg.joint_ids]
+  limits = asset.data.joint_pos_limits[:, asset_cfg.joint_ids]
+  q_center = (limits[..., 1] + limits[..., 0]) / 2.0
+  q_half_range = (limits[..., 1] - limits[..., 0]) / 2.0
+  normalized_pos = torch.abs((current_q - q_center) / q_half_range)
+  out_of_bounds = torch.clamp(normalized_pos - threshold, min=0.0)
+  return torch.sum(torch.square(out_of_bounds), dim=-1)
