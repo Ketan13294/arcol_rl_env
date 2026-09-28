@@ -12,7 +12,9 @@ from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   quat_apply,
+  quat_apply_inverse,
   wrap_to_pi,
+  yaw_quat,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +44,14 @@ class UniformVelocityCommand(CommandTerm):
 
     self.vel_command_b = torch.zeros(self.num_envs, 4, device=self.device)
     self.height_target = torch.zeros(self.num_envs, device=self.device)
+    # Open-loop vz rate for non-height envs; integrated into height_target.
+    self.vz_rate = torch.zeros(self.num_envs, device=self.device)
+    # Envs whose moving height target must be seeded from the robot's height on
+    # the next update (reset reads pre-reset kinematics, so it can't seed there).
+    self._seed_height = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    self.height_site_ids: list[int] = []
+    if cfg.height_site_names:
+      self.height_site_ids, _ = self.robot.find_sites(cfg.height_site_names)
     self.height_error = torch.zeros(self.num_envs, device=self.device)
     self.heading_target = torch.zeros(self.num_envs, device=self.device)
     self.heading_error = torch.zeros(self.num_envs, device=self.device)
@@ -53,29 +63,34 @@ class UniformVelocityCommand(CommandTerm):
     self.is_standing_env = torch.zeros_like(self.is_heading_env)
 
     # --- Arm Command Additions ---
-    self.arm_joint_ids = cfg.arm_joint_ids
-    self.num_arm_joints = len(self.arm_joint_ids) if self.arm_joint_ids else 0
-    
-    if self.num_arm_joints > 0:
-      # Fetch arm joint ranges and apply 0.9 safety scaling
-      jnt_range = env.sim.model.jnt_range[self.arm_joint_ids]
-      q_min = torch.tensor(jnt_range[:, 0], device=self.device)
-      q_max = torch.tensor(jnt_range[:, 1], device=self.device)
-      
-      q_center = (q_max + q_min) / 2.0
-      q_half = (q_max - q_min) / 2.0
-      
-      self.safe_arm_q_min = q_center - 0.9 * q_half
-      self.safe_arm_q_max = q_center + 0.9 * q_half
+    # Arm joint position targets are kept separate from the 4D twist command so
+    # that every consumer of `command` (phase, posture masks, curricula, ...)
+    # keeps its [vx, vy, wz, vz] layout. Arm targets are read via `arm_command`.
+    self.arm_joint_ids: list[int] = []
+    self.arm_joint_names: list[str] = []
+    if cfg.arm_joint_names:
+      self.arm_joint_ids, self.arm_joint_names = self.robot.find_joints(
+        cfg.arm_joint_names, preserve_order=False
+      )
+    self.num_arm_joints = len(self.arm_joint_ids)
 
-      # Fetch maximum velocity limits from physics model and apply 0.9 safety factor
-      # Note: env.sim.model.dof_armature / dof_limit / actuator_velocity_limit depend on MuJoCo spec
-      max_arm_vel = torch.tensor(env.sim.model.actuator_gear[self.arm_joint_ids, 0], device=self.device) # or joint_vel_limit
-      self.safe_arm_vel_limit = 0.9 * max_arm_vel
-      
-      self.arm_q_target = torch.zeros((self.num_envs, self.num_arm_joints), device=self.device)
-      self.arm_q_dot_cmd = torch.zeros((self.num_envs, self.num_arm_joints), device=self.device)
-      self.is_arm_commanded = torch.zeros((self.num_envs, 1), dtype=torch.bool, device=self.device)
+    self.arm_q_target = torch.zeros(self.num_envs, self.num_arm_joints, device=self.device)
+    self.arm_q_ref = torch.zeros_like(self.arm_q_target)
+    self.is_arm_commanded = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    if self.num_arm_joints > 0:
+      # Entity-local joint limits, shrunk around the range center by a safety factor.
+      limits = self.robot.data.joint_pos_limits[0, self.arm_joint_ids]
+      q_center = (limits[:, 1] + limits[:, 0]) / 2.0
+      q_half = (limits[:, 1] - limits[:, 0]) / 2.0
+      self.safe_arm_q_min = q_center - cfg.arm_limit_margin * q_half
+      self.safe_arm_q_max = q_center + cfg.arm_limit_margin * q_half
+
+      self.default_arm_q = self.robot.data.default_joint_pos[:, self.arm_joint_ids].clone()
+      self.arm_q_target[:] = self.default_arm_q
+      self.arm_q_ref[:] = self.default_arm_q
+
+      self.metrics["error_arm_q"] = torch.zeros(self.num_envs, device=self.device)
     # -----------------------------
 
     self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
@@ -94,12 +109,39 @@ class UniformVelocityCommand(CommandTerm):
   def command(self) -> torch.Tensor:
     return self.vel_command_b
 
+  def base_height(self) -> torch.Tensor:
+    """Root height above the lowest foot site (world z if no sites are set)."""
+    root_z = self.robot.data.root_link_pos_w[:, 2]
+    if not self.height_site_ids:
+      return root_z
+    foot_z = self.robot.data.site_pos_w[:, self.height_site_ids, 2]
+    return root_z - foot_z.min(dim=1).values
+
+  def lin_vel_heading(self) -> torch.Tensor:
+    """Root linear velocity in the gravity-aligned heading frame (z is world z)."""
+    return quat_apply_inverse(
+      yaw_quat(self.robot.data.root_link_quat_w), self.robot.data.root_link_lin_vel_w
+    )
+
+  @property
+  def arm_command(self) -> torch.Tensor:
+    """Rate-limited arm joint position reference (num_envs, num_arm_joints)."""
+    return self.arm_q_ref
+
+  def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
+    # Start each episode with the arm reference at the default pose; the
+    # reference then slews toward the freshly sampled target.
+    if self.num_arm_joints > 0:
+      self.arm_q_ref[env_ids] = self.default_arm_q[env_ids]
+    self._seed_height[env_ids] = True
+    return super().reset(env_ids)
+
   def _update_metrics(self) -> None:
     max_command_time = self.cfg.resampling_time_range[1]
     max_command_step = max_command_time / self._env.step_dt
     self.metrics["error_vel_xy"] += (
       torch.norm(
-        self.vel_command_b[:, :2] - self.robot.data.root_link_lin_vel_b[:, :2], dim=-1
+        self.vel_command_b[:, :2] - self.lin_vel_heading()[:, :2], dim=-1
       )
       / max_command_step
     )
@@ -111,6 +153,14 @@ class UniformVelocityCommand(CommandTerm):
       torch.abs(self.vel_command_b[:, 3] - self.robot.data.root_link_lin_vel_w[:, 2])
       / max_command_step
     )
+    if self.num_arm_joints > 0:
+      self.metrics["error_arm_q"] += (
+        torch.mean(
+          torch.abs(self.arm_q_ref - self.robot.data.joint_pos[:, self.arm_joint_ids]),
+          dim=-1,
+        )
+        / max_command_step
+      )
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     r = torch.empty(len(env_ids), device=self.device)
@@ -149,15 +199,6 @@ class UniformVelocityCommand(CommandTerm):
       red_env_ids_up = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_up]]
       self.vel_command_b[red_env_ids_up, 2] = torch.zeros(len(red_env_ids_up), device=self.device).uniform_(0, 0.2)
 
-    if self.cfg.ranges.lin_vel_z[0] < -0.1:
-      num_red_envs_down = max(1, int(0.1 * len(env_ids)))
-      red_env_ids_down = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_down]]
-      self.vel_command_b[red_env_ids_down, 3] = torch.zeros(len(red_env_ids_down), device=self.device).uniform_(-0.1, 0)
-
-    if self.cfg.ranges.lin_vel_z[1] > 0.1:
-      num_red_envs_up = max(1, int(0.1 * len(env_ids)))
-      red_env_ids_up = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_up]]
-      self.vel_command_b[red_env_ids_up, 3] = torch.zeros(len(red_env_ids_up), device=self.device).uniform_(0, 0.1)
 
     if self.cfg.height_command:
       assert self.cfg.ranges.lin_pos_z is not None
@@ -170,19 +211,34 @@ class UniformVelocityCommand(CommandTerm):
       self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
     self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
 
-    self.vel_command_b[env_ids, :3] *= (torch.norm(self.vel_command_b[env_ids, :2], dim=-1)+torch.abs(self.vel_command_b[env_ids, 2]) > 0.1).unsqueeze(1)
+    # Norm gate: zeros all dims (incl. Z) when xy+yaw norm < 0.1 — couples Z to XY/yaw.
+    self.vel_command_b[env_ids, :] *= (torch.norm(self.vel_command_b[env_ids, :2], dim=-1)+torch.abs(self.vel_command_b[env_ids, 2]) > 0.1).unsqueeze(1)
     self.vel_command_b[env_ids, 3] *= (torch.abs(self.vel_command_b[env_ids, 3]) > 0.1).float()
+    # Standing envs: no xy/yaw, but their own vz so standing height changes train.
+    stand_ids = env_ids[self.is_standing_env[env_ids]]
+    if len(stand_ids) > 0:
+      vz = torch.empty(len(stand_ids), device=self.device).uniform_(*self.cfg.ranges.lin_vel_z)
+      self.vel_command_b[stand_ids, 3] = vz * (torch.abs(vz) > 0.1)
+    self._resample_height_reference(env_ids)
 
     # --- Arm Command Resampling ---
     if self.num_arm_joints > 0:
-      # 50% probability that active arm commands are assigned, 50% idle default pose
-      arm_cmd_mask = (torch.rand(len(env_ids), device=self.device) < self.cfg.arm_command_prob)
-      
-      rand_arm = torch.rand((len(env_ids), self.num_arm_joints), device=self.device)
-      sampled_arm_q = self.safe_arm_q_min + rand_arm * (self.safe_arm_q_max - self.safe_arm_q_min)
-      default_arm_q = self.robot.data.default_joint_pos[env_ids][:, self.arm_joint_ids]
-      
-      self.arm_q_target[env_ids] = torch.where(arm_cmd_mask.unsqueeze(-1), sampled_arm_q, default_arm_q)
+      # With probability arm_command_prob sample an active arm target, else hold default.
+      arm_cmd_mask = torch.rand(len(env_ids), device=self.device) < self.cfg.arm_command_prob
+
+      # Sample around the default pose: arm_range_scale in [0, 1] interpolates the
+      # sampling box from the default pose (0) to the safe joint limits (1).
+      default_arm_q = self.default_arm_q[env_ids]
+      scale = self.cfg.arm_range_scale
+      low = default_arm_q + scale * (self.safe_arm_q_min - default_arm_q)
+      high = default_arm_q + scale * (self.safe_arm_q_max - default_arm_q)
+      rand_arm = torch.rand(len(env_ids), self.num_arm_joints, device=self.device)
+      sampled_arm_q = low + rand_arm * (high - low)
+
+      self.arm_q_target[env_ids] = torch.where(
+        arm_cmd_mask.unsqueeze(-1), sampled_arm_q, default_arm_q
+      )
+      self.is_arm_commanded[env_ids] = arm_cmd_mask
     # ------------------------------
 
     init_vel_mask = r.uniform_(0.0, 1.0) < self.cfg.init_velocity_prob
@@ -210,6 +266,17 @@ class UniformVelocityCommand(CommandTerm):
       )
       self.robot.write_root_state_to_sim(root_state, init_vel_env_ids)
 
+  def _resample_height_reference(self, env_ids: torch.Tensor) -> None:
+    """Non-height envs integrate their sampled vz into a moving height target,
+    starting from the current height; height envs keep their sampled target."""
+    if not self.cfg.height_command:
+      return
+    assert self.cfg.ranges.lin_pos_z is not None
+    lo, hi = self.cfg.ranges.lin_pos_z
+    self.vz_rate[env_ids] = self.vel_command_b[env_ids, 3]
+    free_ids = env_ids[~self.is_height_env[env_ids] & ~self._seed_height[env_ids]]
+    self.height_target[free_ids] = torch.clamp(self.base_height()[free_ids], lo, hi)
+
   def _update_command(self) -> None:
     if self.cfg.heading_command:
       self.heading_error = wrap_to_pi(self.heading_target - self.robot.data.heading_w)
@@ -220,29 +287,45 @@ class UniformVelocityCommand(CommandTerm):
         max=self.cfg.ranges.ang_vel_z[1],
       )
     if self.cfg.height_command:
-      self.height_error = self.height_target - self.robot.data.root_link_pos_w[:, 2]
-      env_ids = self.is_height_env.nonzero(as_tuple=False).flatten()
-      self.vel_command_b[env_ids, 3] = torch.clip(
-        self.cfg.height_control_stiffness * self.height_error[env_ids],
+      assert self.cfg.ranges.lin_pos_z is not None
+      lo, hi = self.cfg.ranges.lin_pos_z
+      height = self.base_height()
+      # Seed reset envs' moving targets from fresh kinematics, inside [lo, hi].
+      seed = self._seed_height & ~self.is_height_env
+      self.height_target[seed] = torch.clamp(height[seed], lo, hi)
+      self._seed_height[:] = False
+      # vz is always generated from a height target: non-height envs move their
+      # target at the sampled rate (so the command ~= that rate while tracking),
+      # height envs hold a fixed sampled target. Targets never leave [lo, hi].
+      free = ~self.is_height_env
+      self.height_target[free] = torch.clamp(
+        self.height_target[free] + self.vz_rate[free] * self._env.step_dt, lo, hi
+      )
+      self.height_error = self.height_target - height
+      self.vel_command_b[:, 3] = torch.clip(
+        self.cfg.height_control_stiffness * self.height_error,
         min=self.cfg.ranges.lin_vel_z[0],
         max=self.cfg.ranges.lin_vel_z[1],
       )
+      # Zero vz once the robot is at a height limit in the commanded direction.
+      at_limit = ((height >= hi) & (self.vel_command_b[:, 3] > 0)) | (
+        (height <= lo) & (self.vel_command_b[:, 3] < 0)
+      )
+      self.vel_command_b[at_limit, 3] = 0.0
+      env_ids = self.is_height_env.nonzero(as_tuple=False).flatten()
+      # Height envs are pure height changes: no xy/yaw, so the policy trains
+      # height control while standing (as in run 2026-08-29_20-12-33).
+      self.vel_command_b[env_ids, :3] = 0.0
+    # Standing envs: zero xy/yaw only; vz still comes from their height target.
     standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
-    self.vel_command_b[standing_env_ids, :] = 0.0
+    self.vel_command_b[standing_env_ids, :3] = 0.0
     
     # --- Arm Command Updates ---
     if self.num_arm_joints > 0:
-      curr_arm_q = self.robot.data.joint_pos[:, self.arm_joint_ids]
-      raw_q_dot_cmd = self.cfg.arm_kd * (self.arm_q_target - curr_arm_q)
-      
-      # Clamp commanded velocity to 90% of maximum joint velocity
-      self.arm_q_dot_cmd = torch.clamp(
-          raw_q_dot_cmd, 
-          min=-self.safe_arm_vel_limit, 
-          max=self.safe_arm_vel_limit
-      )
-      
-      self.is_arm_commanded = (torch.norm(self.arm_q_dot_cmd, dim=-1, keepdim=True) > self.cfg.arm_vel_deadband)
+      # Slew the reference toward the target at no more than arm_max_vel rad/s so
+      # the policy tracks smooth, teleop-like arm trajectories instead of steps.
+      max_step = self.cfg.arm_max_vel * self._env.step_dt
+      self.arm_q_ref += torch.clamp(self.arm_q_target - self.arm_q_ref, -max_step, max_step)
     # ---------------------------
 
   # GUI.
@@ -301,20 +384,20 @@ class UniformVelocityCommand(CommandTerm):
           min=ranges.lin_pos_z[0],
           max=ranges.lin_pos_z[1],
           step=0.01,
-          initial_value=0.782,
+          initial_value=ranges.lin_pos_z[1],
         )
 
       if self.num_arm_joints > 0:
         with server.gui.add_folder("Arm Joint Targets"):
-          for idx in range(self.num_arm_joints):
+          for idx, joint_name in enumerate(self.arm_joint_names):
             min_val = float(self.safe_arm_q_min[idx].item())
             max_val = float(self.safe_arm_q_max[idx].item())
             arm_slider = server.gui.add_slider(
-              f"Arm Joint {idx}",
+              joint_name,
               min=min_val,
               max=max_val,
               step=0.02,
-              initial_value=0.0,
+              initial_value=float(self.default_arm_q[0, idx].item()),
             )
             arm_sliders.append(arm_slider)
 
@@ -325,9 +408,9 @@ class UniformVelocityCommand(CommandTerm):
         for s in sliders:
           s.value = 0.0
         if height_slider is not None and ranges.lin_pos_z is not None:
-          height_slider.value = 0.782
-        for s in arm_sliders:
-          s.value = 0.0
+          height_slider.value = ranges.lin_pos_z[1]
+        for j_idx, s in enumerate(arm_sliders):
+          s.value = float(self.default_arm_q[0, j_idx].item())
 
       enable_posZ_btn = server.gui.add_button("Enable Z position:", icon=Icon.SQUARE_X)
 
@@ -347,20 +430,26 @@ class UniformVelocityCommand(CommandTerm):
     if self._joystick_enabled is not None and self._joystick_enabled.value:
       assert self._joystick_get_env_idx is not None
       idx = self._joystick_get_env_idx()
-      for i, s in enumerate(self._joystick_sliders):
+      self.is_standing_env[idx] = False
+      for i, s in enumerate(self._joystick_sliders[:3]):
         self.vel_command_b[idx, i] = s.value
-      if self._joystick_height_slider is not None and self._enable_posZ_handle:
-        self.height_target[idx] = self._joystick_height_slider.value
-        self.is_height_env[idx] = True
-        height_error = self.height_target[idx] - self.robot.data.root_link_pos_w[idx, 2]
-        self.vel_command_b[idx, 3] = torch.clamp(
-          self.cfg.height_control_stiffness * height_error,
-          min=self.cfg.ranges.lin_vel_z[0],
-          max=self.cfg.ranges.lin_vel_z[1],
-        )
+      if self.cfg.height_command:
+        # Z goes through the same height-target path as training: the height
+        # slider sets a fixed target, otherwise the vz slider moves the target.
+        if self._joystick_height_slider is not None and self._enable_posZ_handle:
+          self.height_target[idx] = self._joystick_height_slider.value
+          self.is_height_env[idx] = True
+        else:
+          if self.is_height_env[idx]:
+            self.height_target[idx] = self.base_height()[idx]
+          self.is_height_env[idx] = False
+          self.vz_rate[idx] = self._joystick_sliders[3].value
+      else:
+        self.vel_command_b[idx, 3] = self._joystick_sliders[3].value
       if len(self._joystick_arm_sliders) > 0:
         for j_idx, s in enumerate(self._joystick_arm_sliders):
           self.arm_q_target[idx, j_idx] = s.value
+        self.is_arm_commanded[idx] = True
 
   # Visualization.
 
@@ -439,12 +528,20 @@ class UniformVelocityCommandCfg(CommandTermCfg):
   rel_heading_envs: float = 1.0
   rel_height_envs: float = 1.0
   init_velocity_prob: float = 0.0
+  height_site_names: tuple[str, ...] = ()
+  """Foot sites; height is measured from the lowest one (world z if empty)."""
 
   # Arm Joint Parameters
-  arm_joint_ids: list[int] = field(default_factory=list)
-  arm_kd: float = 8.0
+  arm_joint_names: tuple[str, ...] = ()
+  """Joint name patterns of the commanded arm joints (empty disables arm commands)."""
   arm_command_prob: float = 0.5
-  arm_vel_deadband: float = 0.05
+  """Probability that a resample assigns an active arm target instead of the default pose."""
+  arm_range_scale: float = 0.5
+  """Sampling box as a fraction of the distance from the default pose to the safe limits."""
+  arm_limit_margin: float = 0.9
+  """Fraction of the joint half-range treated as the safe target range."""
+  arm_max_vel: float = 1.5
+  """Maximum slew rate (rad/s) of the arm reference toward its target."""
 
   @dataclass
   class Ranges:

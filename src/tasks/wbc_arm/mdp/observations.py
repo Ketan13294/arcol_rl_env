@@ -49,7 +49,10 @@ def phase(env: ManagerBasedRlEnv, period: float, command_name: str) -> torch.Ten
   phase = torch.zeros(env.num_envs, 2, device=env.device)
   phase[:, 0] = torch.sin(global_phase * torch.pi * 2.0)
   phase[:, 1] = torch.cos(global_phase * torch.pi * 2.0)
-  stand_mask = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) < 0.1
+  # Gait clock is off unless xy/yaw is commanded, so height-only (vz) commands
+  # don't cue stepping. Matches the xy+yaw masks used by the foot rewards.
+  command = env.command_manager.get_command(command_name)
+  stand_mask = (torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])) < 0.1
   phase = torch.where(stand_mask.unsqueeze(1), torch.zeros_like(phase), phase)
   return phase
 
@@ -68,3 +71,11 @@ def base_height(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASS
   support_z = torch.where(has_contact, min_contact_z, min_feet_z)
 
   return base_z - support_z
+
+
+def arm_joint_command_rel(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+  """Arm joint position reference relative to the default pose (joint_pos_rel convention)."""
+  command_term = env.command_manager.get_term(command_name)
+  if command_term.num_arm_joints == 0:
+    return torch.zeros(env.num_envs, 0, device=env.device)
+  return command_term.arm_command - command_term.default_arm_q
