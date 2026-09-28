@@ -12,7 +12,9 @@ from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   quat_apply,
+  quat_apply_inverse,
   wrap_to_pi,
+  yaw_quat,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +44,14 @@ class UniformVelocityCommand(CommandTerm):
 
     self.vel_command_b = torch.zeros(self.num_envs, 4, device=self.device)
     self.height_target = torch.zeros(self.num_envs, device=self.device)
+    # Open-loop vz rate for non-height envs; integrated into height_target.
+    self.vz_rate = torch.zeros(self.num_envs, device=self.device)
+    # Envs whose moving height target must be seeded from the robot's height on
+    # the next update (reset reads pre-reset kinematics, so it can't seed there).
+    self._seed_height = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    self.height_site_ids: list[int] = []
+    if cfg.height_site_names:
+      self.height_site_ids, _ = self.robot.find_sites(cfg.height_site_names)
     self.height_error = torch.zeros(self.num_envs, device=self.device)
     self.heading_target = torch.zeros(self.num_envs, device=self.device)
     self.heading_error = torch.zeros(self.num_envs, device=self.device)
@@ -67,12 +77,30 @@ class UniformVelocityCommand(CommandTerm):
   def command(self) -> torch.Tensor:
     return self.vel_command_b
 
+  def base_height(self) -> torch.Tensor:
+    """Root height above the lowest foot site (world z if no sites are set)."""
+    root_z = self.robot.data.root_link_pos_w[:, 2]
+    if not self.height_site_ids:
+      return root_z
+    foot_z = self.robot.data.site_pos_w[:, self.height_site_ids, 2]
+    return root_z - foot_z.min(dim=1).values
+
+  def lin_vel_heading(self) -> torch.Tensor:
+    """Root linear velocity in the gravity-aligned heading frame (z is world z)."""
+    return quat_apply_inverse(
+      yaw_quat(self.robot.data.root_link_quat_w), self.robot.data.root_link_lin_vel_w
+    )
+
+  def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
+    self._seed_height[env_ids] = True
+    return super().reset(env_ids)
+
   def _update_metrics(self) -> None:
     max_command_time = self.cfg.resampling_time_range[1]
     max_command_step = max_command_time / self._env.step_dt
     self.metrics["error_vel_xy"] += (
       torch.norm(
-        self.vel_command_b[:, :2] - self.robot.data.root_link_lin_vel_b[:, :2], dim=-1
+        self.vel_command_b[:, :2] - self.lin_vel_heading()[:, :2], dim=-1
       )
       / max_command_step
     )
@@ -81,7 +109,7 @@ class UniformVelocityCommand(CommandTerm):
       / max_command_step
     )
     self.metrics["error_vel_z"] += (
-      # lin_vel_z is commanded in world frame; x/y remain body-frame commands.
+      # lin_vel_z is commanded in world frame; x/y are heading-frame commands.
       torch.abs(self.vel_command_b[:, 3] - self.robot.data.root_link_lin_vel_w[:, 2])
       / max_command_step
     )
@@ -91,7 +119,7 @@ class UniformVelocityCommand(CommandTerm):
     self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
     self.vel_command_b[env_ids, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
     self.vel_command_b[env_ids, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
-    # Keep the vertical command in world frame; x/y and yaw are body-frame.
+    # vz is world-frame; x/y are in the gravity-aligned heading frame.
     self.vel_command_b[env_ids, 3] = r.uniform_(*self.cfg.ranges.lin_vel_z)
 
     # Near-zero subsampling: increases command density near zero for each dimension.
@@ -125,22 +153,13 @@ class UniformVelocityCommand(CommandTerm):
       red_env_ids_up = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_up]]
       self.vel_command_b[red_env_ids_up, 2] = torch.zeros(len(red_env_ids_up), device=self.device).uniform_(0, 0.2)
 
-    if self.cfg.ranges.lin_vel_z[0] < -0.1:
-      num_red_envs_down = max(1, int(0.1 * len(env_ids)))
-      red_env_ids_down = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_down]]
-      self.vel_command_b[red_env_ids_down, 3] = torch.zeros(len(red_env_ids_down), device=self.device).uniform_(-0.1, 0)
 
-    if self.cfg.ranges.lin_vel_z[1] > 0.1:
-      num_red_envs_up = max(1, int(0.1 * len(env_ids)))
-      red_env_ids_up = env_ids[torch.randperm(len(env_ids), device=self.device)[:num_red_envs_up]]
-      self.vel_command_b[red_env_ids_up, 3] = torch.zeros(len(red_env_ids_up), device=self.device).uniform_(0, 0.1)
-
-    # Norm gate: zeros all dims (incl. Z) when xy+yaw norm < 0.05 — couples Z to XY/yaw.
+    # Norm gate: zeros all dims (incl. Z) when xy+yaw norm < 0.1 — couples Z to XY/yaw.
     lin_vel_norm = torch.norm(self.vel_command_b[env_ids, :2], dim=-1)
     ang_vel_abs = torch.abs(self.vel_command_b[env_ids, 2])
     lin_vel_z_abs = torch.abs(self.vel_command_b[env_ids, 3])
     total_command = lin_vel_norm + ang_vel_abs
-    self.vel_command_b[env_ids, :3] *= (total_command > 0.1).unsqueeze(1)
+    self.vel_command_b[env_ids, :] *= (total_command > 0.1).unsqueeze(1)
 
     if self.cfg.height_command:
       assert self.cfg.ranges.lin_pos_z is not None
@@ -153,6 +172,12 @@ class UniformVelocityCommand(CommandTerm):
       self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
     self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
     self.vel_command_b[env_ids,  3:4] *= (lin_vel_z_abs > 0.1).unsqueeze(1)
+    # Standing envs: no xy/yaw, but their own vz so standing height changes train.
+    stand_ids = env_ids[self.is_standing_env[env_ids]]
+    if len(stand_ids) > 0:
+      vz = torch.empty(len(stand_ids), device=self.device).uniform_(*self.cfg.ranges.lin_vel_z)
+      self.vel_command_b[stand_ids, 3] = vz * (torch.abs(vz) > 0.1)
+    self._resample_height_reference(env_ids)
 
     init_vel_mask = r.uniform_(0.0, 1.0) < self.cfg.init_velocity_prob
     init_vel_env_ids = env_ids[init_vel_mask]
@@ -181,6 +206,17 @@ class UniformVelocityCommand(CommandTerm):
       )
       self.robot.write_root_state_to_sim(root_state, init_vel_env_ids)
 
+  def _resample_height_reference(self, env_ids: torch.Tensor) -> None:
+    """Non-height envs integrate their sampled vz into a moving height target,
+    starting from the current height; height envs keep their sampled target."""
+    if not self.cfg.height_command:
+      return
+    assert self.cfg.ranges.lin_pos_z is not None
+    lo, hi = self.cfg.ranges.lin_pos_z
+    self.vz_rate[env_ids] = self.vel_command_b[env_ids, 3]
+    free_ids = env_ids[~self.is_height_env[env_ids] & ~self._seed_height[env_ids]]
+    self.height_target[free_ids] = torch.clamp(self.base_height()[free_ids], lo, hi)
+
   def _update_command(self) -> None:
     if self.cfg.heading_command:
       self.heading_error = wrap_to_pi(self.heading_target - self.robot.data.heading_w)
@@ -191,15 +227,38 @@ class UniformVelocityCommand(CommandTerm):
         max=self.cfg.ranges.ang_vel_z[1],
       )
     if self.cfg.height_command:
-      self.height_error = self.height_target - self.robot.data.root_link_pos_w[:, 2]
-      env_ids = self.is_height_env.nonzero(as_tuple=False).flatten()
-      self.vel_command_b[env_ids, 3] = torch.clip(
-        self.cfg.height_control_stiffness * self.height_error[env_ids],
+      assert self.cfg.ranges.lin_pos_z is not None
+      lo, hi = self.cfg.ranges.lin_pos_z
+      height = self.base_height()
+      # Seed reset envs' moving targets from fresh kinematics, inside [lo, hi].
+      seed = self._seed_height & ~self.is_height_env
+      self.height_target[seed] = torch.clamp(height[seed], lo, hi)
+      self._seed_height[:] = False
+      # vz is always generated from a height target: non-height envs move their
+      # target at the sampled rate (so the command ~= that rate while tracking),
+      # height envs hold a fixed sampled target. Targets never leave [lo, hi].
+      free = ~self.is_height_env
+      self.height_target[free] = torch.clamp(
+        self.height_target[free] + self.vz_rate[free] * self._env.step_dt, lo, hi
+      )
+      self.height_error = self.height_target - height
+      self.vel_command_b[:, 3] = torch.clip(
+        self.cfg.height_control_stiffness * self.height_error,
         min=self.cfg.ranges.lin_vel_z[0],
         max=self.cfg.ranges.lin_vel_z[1],
       )
+      # Zero vz once the robot is at a height limit in the commanded direction.
+      at_limit = ((height >= hi) & (self.vel_command_b[:, 3] > 0)) | (
+        (height <= lo) & (self.vel_command_b[:, 3] < 0)
+      )
+      self.vel_command_b[at_limit, 3] = 0.0
+      env_ids = self.is_height_env.nonzero(as_tuple=False).flatten()
+      # Height envs are pure height changes: no xy/yaw, so the policy trains
+      # height control while standing (as in run 2026-08-29_20-12-33).
+      self.vel_command_b[env_ids, :3] = 0.0
+    # Standing envs: zero xy/yaw only; vz still comes from their height target.
     standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
-    self.vel_command_b[standing_env_ids, :] = 0.0
+    self.vel_command_b[standing_env_ids, :3] = 0.0
 
   # GUI.
 
@@ -256,7 +315,7 @@ class UniformVelocityCommand(CommandTerm):
           min=ranges.lin_pos_z[0],
           max=ranges.lin_pos_z[1],
           step=0.01,
-          initial_value=0.762,
+          initial_value=ranges.lin_pos_z[1],
         )
 
       zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
@@ -266,7 +325,7 @@ class UniformVelocityCommand(CommandTerm):
         for s in sliders:
           s.value = 0.0
         if height_slider is not None and ranges.lin_pos_z is not None:
-          height_slider.value = 0.762
+          height_slider.value = ranges.lin_pos_z[1]
 
       enable_posZ_btn = server.gui.add_button("Enable Z position:", icon=Icon.SQUARE_X)
 
@@ -285,17 +344,22 @@ class UniformVelocityCommand(CommandTerm):
     if self._joystick_enabled is not None and self._joystick_enabled.value:
       assert self._joystick_get_env_idx is not None
       idx = self._joystick_get_env_idx()
-      for i, s in enumerate(self._joystick_sliders):
+      self.is_standing_env[idx] = False
+      for i, s in enumerate(self._joystick_sliders[:3]):
         self.vel_command_b[idx, i] = s.value
-      if self._joystick_height_slider is not None and self._enable_posZ_handle:
-        self.height_target[idx] = self._joystick_height_slider.value
-        self.is_height_env[idx] = True
-        height_error = self.height_target[idx] - self.robot.data.root_link_pos_w[idx, 2]
-        self.vel_command_b[idx, 3] = torch.clamp(
-          self.cfg.height_control_stiffness * height_error,
-          min=self.cfg.ranges.lin_vel_z[0],
-          max=self.cfg.ranges.lin_vel_z[1],
-        )
+      if self.cfg.height_command:
+        # Z goes through the same height-target path as training: the height
+        # slider sets a fixed target, otherwise the vz slider moves the target.
+        if self._joystick_height_slider is not None and self._enable_posZ_handle:
+          self.height_target[idx] = self._joystick_height_slider.value
+          self.is_height_env[idx] = True
+        else:
+          if self.is_height_env[idx]:
+            self.height_target[idx] = self.base_height()[idx]
+          self.is_height_env[idx] = False
+          self.vz_rate[idx] = self._joystick_sliders[3].value
+      else:
+        self.vel_command_b[idx, 3] = self._joystick_sliders[3].value
 
   # Visualization.
 
@@ -381,6 +445,8 @@ class UniformVelocityCommandCfg(CommandTermCfg):
   rel_heading_envs: float = 1.0
   rel_height_envs: float = 1.0
   init_velocity_prob: float = 0.0
+  height_site_names: tuple[str, ...] = ()
+  """Foot sites; height is measured from the lowest one (world z if empty)."""
 
   @dataclass
   class Ranges:
