@@ -181,8 +181,8 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     "twist": UniformVelocityCommandCfg(
       entity_name="robot",
       resampling_time_range=(3.0, 8.0),
-      rel_standing_envs=0.08,
-      rel_height_envs=1.0,
+      rel_standing_envs=0.2,
+      rel_height_envs=0.05,
       heading_command=False,
       heading_control_stiffness=0.5,
       debug_vis=True,
@@ -194,7 +194,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
         ang_vel_z=(-1.0, 1.0),
         lin_vel_z=(-0.5,0.5),
         # heading=(-math.pi, math.pi),
-        lin_pos_z=(0.5, 0.76),
+        lin_pos_z=(0.5, 0.80),  # Upper limit overridden per-robot.
       ),
     )
   }
@@ -211,7 +211,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
         "pose_range": {
           "x": (-0.5, 0.5),
           "y": (-0.5, 0.5),
-          "z": (0.5, 0.8),
+          "z": (0.0, 0.0),  # Offset on the default root height (spawn at rest height).
           "yaw": (-3.14, 3.14),
         },
         "velocity_range": {},
@@ -255,10 +255,10 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       mode="startup",
       func=dr.joint_damping,
       params={
-        "asset_cfg": SceneEntityCfg("robot", geom_names=()),  # Set per-robot.
+        "asset_cfg": SceneEntityCfg("robot"),  # All joints.
         "operation": "abs",
-        "ranges": (0.3, 1.6),
-        "shared_random": True,  # All foot geoms share the same friction.
+        "ranges": (0.1, 1.6),
+        "shared_random": True,  # All joints share the same damping.
       },
     ),
     "encoder_bias": EventTermCfg(
@@ -308,12 +308,12 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "undesired_velocity": RewardTermCfg(
       func=mdp.undesired_velocity,
-      weight=-1.0,
+      weight=-0.15,
       params={"command_name": "twist", "command_threshold": 0.1},
     ),
     "undesired_stepping": RewardTermCfg(
       func=mdp.undesired_stepping,
-      weight=-2.5,
+      weight=-0.5,
       # weight=-0.5,
       params={"sensor_name": "feet_ground_contact", "command_name": "twist", "command_threshold": 0.1},
     ),
@@ -412,7 +412,9 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       params={
         "command_name": "twist",
         "command_threshold": 0.1,
-        "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+        # Sagittal leg joints set the base height, so holding a commanded height
+        # must not be penalized as deviation from the default pose.
+        "asset_cfg": SceneEntityCfg("robot", joint_names="^(?!.*(hip_pitch|knee|ankle_pitch)).*$"),
       },
     ),
     "stand_still_upper": RewardTermCfg(
@@ -421,7 +423,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       params={
         "command_name": "twist",
         "command_threshold": 0.1,
-        "asset_cfg": SceneEntityCfg("robot", joint_names="^(?!.*(hip_pitch|knee_pitch|ankle_pitch)).*$"),
+        "asset_cfg": SceneEntityCfg("robot", joint_names="^(?!.*(hip_pitch|knee|ankle_pitch)).*$"),
       },
     ),
   }
@@ -442,7 +444,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
         "asset_cfg": SceneEntityCfg(
           "robot", site_names=("left_foot", "right_foot")
         ),
-        "min_height": 0.4,
+        "min_height": 0.35,
       },
     ),
   }

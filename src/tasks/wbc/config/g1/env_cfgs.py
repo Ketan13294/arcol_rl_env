@@ -15,6 +15,11 @@ from src.tasks.wbc.mdp.velocity_command import UniformVelocityCommandCfg
 from src.tasks.wbc.velocity_env_cfg import make_wbc_env_cfg
 
 
+# Upper limit of commanded base height (above the lowest foot site). For
+# reference, the knees-straight height from g1.xml kinematics is 0.792 m.
+G1_MAX_BASE_HEIGHT = 0.78
+
+
 def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Create Unitree G1 rough terrain velocity configuration."""
   cfg = make_wbc_env_cfg()
@@ -74,6 +79,9 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   twist_cmd = cfg.commands["twist"]
   assert isinstance(twist_cmd, UniformVelocityCommandCfg)
   twist_cmd.viz.z_offset = 1.15
+  twist_cmd.height_site_names = site_names
+  assert twist_cmd.ranges.lin_pos_z is not None
+  twist_cmd.ranges.lin_pos_z = (twist_cmd.ranges.lin_pos_z[0], G1_MAX_BASE_HEIGHT)
 
   cfg.observations["critic"].terms["foot_height"].params[
     "asset_cfg"
@@ -90,7 +98,27 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # - Shoulders/elbows get moderate freedom for natural arm swing during walking.
   # - Wrists are loose (0.3) since they don't affect balance much.
   # Running values are ~1.5-2x walking values to accommodate larger motion range.
-  cfg.rewards["pose"].params["std_standing"] = {".*": 0.05}
+  # Standing keeps the height-regime tolerance on the sagittal leg joints so a
+  # commanded height can be held once reached (the base height is set by them).
+  cfg.rewards["pose"].params["std_standing"] = {
+    # Lower body.
+    r".*hip_pitch.*": 0.5,
+    r".*hip_roll.*": 0.05,
+    r".*hip_yaw.*": 0.05,
+    r".*knee.*": 0.5,
+    r".*ankle_pitch.*": 0.15,
+    r".*ankle_roll.*": 0.05,
+    # Waist.
+    r".*waist_yaw.*": 0.05,
+    r".*waist_roll.*": 0.05,
+    r".*waist_pitch.*": 0.05,
+    # Arms.
+    r".*shoulder_pitch.*": 0.05,
+    r".*shoulder_roll.*": 0.05,
+    r".*shoulder_yaw.*": 0.05,
+    r".*elbow.*": 0.05,
+    r".*wrist.*": 0.05,
+  }
   cfg.rewards["pose"].params["std_height"] = {
     # Lower body.
     r".*hip_pitch.*": 0.5,
@@ -215,6 +243,6 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
     twist_cmd.ranges.ang_vel_z = (-0.5, 0.5)
     twist_cmd.ranges.lin_vel_z = (-0.5, 0.5)
-    twist_cmd.ranges.lin_pos_z = (0.5, 0.8)
+    twist_cmd.ranges.lin_pos_z = (0.5, G1_MAX_BASE_HEIGHT)
 
   return cfg
