@@ -18,6 +18,9 @@ from src.tasks.wbc.velocity_env_cfg import make_wbc_env_cfg
 # Upper limit of commanded base height (above the lowest foot site). For
 # reference, the knees-straight height from g1.xml kinematics is 0.792 m.
 G1_MAX_BASE_HEIGHT = 0.78
+# Base height (above the lowest foot) the G1 settles to standing in the default
+# pose; envs commanded with all velocities zero hold this height.
+G1_REST_BASE_HEIGHT = 0.735
 
 
 def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -80,6 +83,7 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   assert isinstance(twist_cmd, UniformVelocityCommandCfg)
   twist_cmd.viz.z_offset = 1.15
   twist_cmd.height_site_names = site_names
+  twist_cmd.rest_height = G1_REST_BASE_HEIGHT
   assert twist_cmd.ranges.lin_pos_z is not None
   twist_cmd.ranges.lin_pos_z = (twist_cmd.ranges.lin_pos_z[0], G1_MAX_BASE_HEIGHT)
 
