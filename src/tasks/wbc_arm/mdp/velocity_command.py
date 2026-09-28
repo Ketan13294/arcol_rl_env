@@ -268,13 +268,25 @@ class UniformVelocityCommand(CommandTerm):
 
   def _resample_height_reference(self, env_ids: torch.Tensor) -> None:
     """Non-height envs integrate their sampled vz into a moving height target,
-    starting from the current height; height envs keep their sampled target."""
+    starting from the current height; height envs keep their sampled target.
+    Envs with all velocities zero hold rest_height instead (if set)."""
     if not self.cfg.height_command:
       return
     assert self.cfg.ranges.lin_pos_z is not None
     lo, hi = self.cfg.ranges.lin_pos_z
     self.vz_rate[env_ids] = self.vel_command_b[env_ids, 3]
-    free_ids = env_ids[~self.is_height_env[env_ids] & ~self._seed_height[env_ids]]
+    free = ~self.is_height_env[env_ids]
+    if self.cfg.rest_height is not None:
+      cmd = self.vel_command_b[env_ids]
+      idle_xy = self.is_standing_env[env_ids] | (
+        (torch.norm(cmd[:, :2], dim=-1) + torch.abs(cmd[:, 2])) < 0.1
+      )
+      rest = free & idle_xy & (self.vz_rate[env_ids] == 0)
+      rest_ids = env_ids[rest]
+      self.height_target[rest_ids] = min(max(self.cfg.rest_height, lo), hi)
+      self._seed_height[rest_ids] = False  # Fixed target; nothing to seed.
+      free = free & ~rest
+    free_ids = env_ids[free & ~self._seed_height[env_ids]]
     self.height_target[free_ids] = torch.clamp(self.base_height()[free_ids], lo, hi)
 
   def _update_command(self) -> None:
@@ -529,6 +541,8 @@ class UniformVelocityCommandCfg(CommandTermCfg):
   rel_height_envs: float = 1.0
   init_velocity_prob: float = 0.0
   height_site_names: tuple[str, ...] = ()
+  rest_height: float | None = None
+  """Height target for envs with all velocities zero (None: hold current height)."""
   """Foot sites; height is measured from the lowest one (world z if empty)."""
 
   # Arm Joint Parameters
