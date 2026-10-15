@@ -69,7 +69,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       params={"command_name": "twist"},
     ),
     "arm_command": ObservationTermCfg(
-      func=mdp.arm_joint_command_rel,
+      func=mdp.arm_joint_vel_command,
       params={"command_name": "twist"},
     ),
     "phase": ObservationTermCfg(
@@ -321,15 +321,15 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
       # weight=-0.5,
       params={"sensor_name": "feet_ground_contact", "command_name": "twist", "command_threshold": 0.1},
     ),
-    "track_arm_joint_pos": RewardTermCfg(
-      func=mdp.track_arm_joint_pos,
+    "track_arm_joint_vel": RewardTermCfg(
+      func=mdp.track_arm_joint_vel,
       weight=1.0,
-      params={"command_name": "twist", "std": 0.25},
+      params={"command_name": "twist", "std": 0.5},
     ),
     "arm_joint_vel": RewardTermCfg(
       func=mdp.arm_joint_vel_penalty,
       weight=-1e-3,
-      params={"asset_cfg": SceneEntityCfg("robot", joint_names=())},  # Set per-robot.
+      params={"command_name": "twist", "command_threshold": 0.05},
     ),
     "body_orientation_l2": RewardTermCfg(
       func=mdp.body_orientation_l2,

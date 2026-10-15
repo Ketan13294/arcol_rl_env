@@ -540,18 +540,18 @@ def stand_still_upper(
 ##
 
 
-def track_arm_joint_pos(
+def track_arm_joint_vel(
   env: ManagerBasedRlEnv,
   command_name: str,
   std: float,
 ) -> torch.Tensor:
-  """Reward tracking of the commanded arm joint position reference."""
+  """Reward tracking of the arm joint velocity command (all arm joints)."""
   command_term = env.command_manager.get_term(command_name)
   asset: Entity = command_term.robot
   if command_term.num_arm_joints == 0:
     return torch.zeros(env.num_envs, device=env.device)
-  current_q = asset.data.joint_pos[:, command_term.arm_joint_ids]
-  error_sq = torch.mean(torch.square(current_q - command_term.arm_command), dim=-1)
+  qd = asset.data.joint_vel[:, command_term.arm_joint_ids]
+  error_sq = torch.mean(torch.square(qd - command_term.arm_command), dim=-1)
   return torch.exp(-error_sq / std**2)
 
 
@@ -581,11 +581,14 @@ def arm_action_acc_penalty(
 
 def arm_joint_vel_penalty(
   env: ManagerBasedRlEnv,
-  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  command_name: str,
+  command_threshold: float = 0.05,
 ) -> torch.Tensor:
-  """Penalize high arm joint velocities to suppress aggressive or wild swings."""
-  asset: Entity = env.scene[asset_cfg.name]
-  return torch.sum(torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=-1)
+  """Penalize arm joint velocities on joints whose commanded velocity is ~0 (holding)."""
+  command_term = env.command_manager.get_term(command_name)
+  qd = command_term.robot.data.joint_vel[:, command_term.arm_joint_ids]
+  holding = torch.abs(command_term.arm_command) < command_threshold
+  return torch.sum(torch.square(qd) * holding, dim=-1)
 
 
 def arm_joint_acc_penalty(

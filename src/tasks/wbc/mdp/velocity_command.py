@@ -458,9 +458,9 @@ class UniformVelocityCommandCfg(CommandTermCfg):
   rel_height_envs: float = 1.0
   init_velocity_prob: float = 0.0
   height_site_names: tuple[str, ...] = ()
+  """Foot sites; height is measured from the lowest one (world z if empty)."""
   rest_height: float | None = None
   """Height target for envs with all velocities zero (None: hold current height)."""
-  """Foot sites; height is measured from the lowest one (world z if empty)."""
 
   @dataclass
   class Ranges:
