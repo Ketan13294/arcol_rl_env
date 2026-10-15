@@ -73,9 +73,9 @@ def base_height(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASS
   return base_z - support_z
 
 
-def arm_joint_command_rel(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
-  """Arm joint position reference relative to the default pose (joint_pos_rel convention)."""
+def arm_joint_vel_command(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+  """Arm joint velocity command (rad/s), P-controlled toward the arm target."""
   command_term = env.command_manager.get_term(command_name)
   if command_term.num_arm_joints == 0:
     return torch.zeros(env.num_envs, 0, device=env.device)
-  return command_term.arm_command - command_term.default_arm_q
+  return command_term.arm_command

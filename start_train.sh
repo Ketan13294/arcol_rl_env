@@ -10,10 +10,15 @@ if [ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null)" != "0" ]; then
   sudo -n sysctl -w kernel.numa_balancing=0 2>/dev/null || true
 fi
 
-taskset -c 5-9 python scripts/train.py Unitree-G1-Flat-WBC \
-  --env.scene.num-envs=4096 \
+# taskset -c 5-9 python scripts/train.py Unitree-G1-Flat-WBC \
+#   --env.scene.num-envs=5096 \
+#   --agent.run_name=CorrectionsDone \
+
+
+taskset -c 5-9 python scripts/train.py Unitree-G1-Flat-WBC-ARM \
+  --env.scene.num-envs=5096 \
+  --agent.run_name=InitalArm \
+  --agent.load_run=2026-10-11_22-32-30_InitalArm\
+  --agent.load_checkpoint=model_13500.pt \
   --agent.resume=True \
-  --agent.load_run=2026-08-29_20-12-33 \
-  --agent.load_checkpoint=model_12000.pt \
-  --agent.run_name=addedheightMovementPenalty \
 

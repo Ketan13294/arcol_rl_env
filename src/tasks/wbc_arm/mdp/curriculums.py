@@ -110,3 +110,64 @@ def reward_weight(
     if env.common_step_counter > stage["step"]:
       reward_term_cfg.weight = stage["weight"]
   return torch.tensor([reward_term_cfg.weight])
+
+
+
+class tracking_gated_disturbance:
+  """Group curriculum for delayed_body_impulse events.
+
+  Score = population mean of tracking rewards / weight, smoothed by an EMA.
+  Disturbances stay off until the score reaches `threshold`; each promotion raises
+  every cap by `increment`, restarts the cooldown and clears the score, so the gate
+  is re-earned at the new level.
+  Caps are force/torque norms: components are sampled in ±cap/√3, so |F| <= cap.
+  """
+
+  def __init__(self, cfg, env: ManagerBasedRlEnv):
+    names = env.reward_manager.active_terms
+    p = cfg.params
+    self._idx = [names.index(n) for n in p["tracking_terms"]]
+    self._weights = torch.tensor(
+      [env.reward_manager.get_term_cfg(n).weight for n in p["tracking_terms"]], device=env.device
+    )
+    self._score = torch.zeros((), device=env.device)
+    self._level = 0
+    self._last_promotion = 0
+
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    del env_ids  # Group state; nothing per env.
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    tracking_terms: tuple[str, ...],
+    events: dict[str, dict[str, tuple[float, float]]],
+    increment: float = 5.0,
+    threshold: float = 0.8,
+    cooldown_steps: int = 2400,
+    ema_rate: float = 0.01,
+  ) -> dict[str, torch.Tensor]:
+    del env_ids, command_name, tracking_terms  # Score uses all envs; terms resolved in __init__.
+    # shortcut: reads RewardManager._step_reward (no public batch accessor), switch if mjlab adds one.
+    step = env.reward_manager._step_reward
+    score = (step[:, self._idx] / self._weights).mean()
+    self._score += ema_rate * (score - self._score)
+
+    since = env.common_step_counter - self._last_promotion
+    if since >= cooldown_steps and self._score.item() >= threshold:
+      self._level += 1
+      self._last_promotion = env.common_step_counter
+      self._score.zero_()
+      for name, caps in events.items():
+        params = env.event_manager.get_term_cfg(name).params
+        for key, (start, cap) in caps.items():
+          c = min(start + (self._level - 1) * increment, cap) / 3**0.5
+          params[f"{key}_range"] = (-c, c)
+
+    out = {"level": torch.tensor(float(self._level)), "score": self._score.clone()}
+    for name in events:
+      params = env.event_manager.get_term_cfg(name).params
+      out[f"{name}_force_cap"] = torch.tensor(params["force_range"][1] * 3**0.5)
+    return out

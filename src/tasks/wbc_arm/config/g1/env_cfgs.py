@@ -11,8 +11,10 @@ from src.assets.robots import (
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
 from src.tasks.wbc_arm import mdp
 from src.tasks.wbc_arm.mdp.velocity_command import UniformVelocityCommandCfg
@@ -108,7 +110,12 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
-  joint_pos_action.scale = G1_ACTION_SCALE
+  # Waist roll/pitch are locked (±0.005 rad in g1.xml): zero action scale holds them at
+  # default while keeping the 29-dim action/obs layout; they skip limit penalty and bias.
+  joint_pos_action.scale = {**G1_ACTION_SCALE, "waist_pitch_joint": 0.0, "waist_roll_joint": 0.0}
+  unlocked = r"^(?!waist_(roll|pitch)_joint$).*$"
+  cfg.events["encoder_bias"].params["asset_cfg"] = SceneEntityCfg("robot", joint_names=(unlocked,))
+  cfg.rewards["joint_pos_limits"].params["asset_cfg"] = SceneEntityCfg("robot", joint_names=(unlocked,))
 
   cfg.viewer.body_name = "torso_link"
 
@@ -120,6 +127,57 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   assert twist_cmd.ranges.lin_pos_z is not None
   twist_cmd.ranges.lin_pos_z = (twist_cmd.ranges.lin_pos_z[0], G1_MAX_BASE_HEIGHT)
   twist_cmd.arm_joint_names = G1_ARM_JOINT_NAMES
+  # Full joint space within 0.8x the limits; self-collision avoidance is the
+  # high-level planner's job (arm links are excluded from self-collision above).
+  twist_cmd.arm_range_scale = 1.0
+  twist_cmd.arm_limit_margin = 0.8
+  # Heavier proximal joints get lower gains; light wrists respond faster.
+  twist_cmd.arm_kp = {
+    r".*_shoulder_(pitch|roll)_joint": 3.0,
+    r".*_shoulder_yaw_joint": 4.0,
+    r".*_elbow_joint": 4.0,
+    r".*_wrist_.*_joint": 6.0,
+  }
+  # Pelvis and hand pushes; off (zero ranges) until the tracking gate promotes them.
+  # Each episode's first pulse waits 5 s.
+  impulse = {"force_range": (0.0, 0.0), "torque_range": (0.0, 0.0), "start_delay_s": 5.0}
+  cfg.events["base_impulse"] = EventTermCfg(
+    func=mdp.delayed_body_impulse,
+    mode="step",
+    params={
+      **impulse,
+      "duration_s": (0.1, 0.3),
+      "cooldown_s": (3.0, 6.0),
+      "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
+    },
+  )
+  cfg.events["hand_impulse"] = EventTermCfg(
+    func=mdp.delayed_body_impulse,
+    mode="step",
+    params={
+      **impulse,
+      "duration_s": (1.0, 3.0),
+      "cooldown_s": (4.0, 8.0),
+      "asset_cfg": SceneEntityCfg("robot", body_names=("left_wrist_yaw_link", "right_wrist_yaw_link")),
+    },
+  )
+  cfg.curriculum["disturbance"] = CurriculumTermCfg(
+    func=mdp.tracking_gated_disturbance,
+    params={
+      "command_name": "twist",
+      "tracking_terms": (
+        "track_linear_velocity",
+        "track_angular_velocity",
+        "track_linear_velocity_z",
+        "track_arm_joint_vel",
+      ),
+      "events": {
+        "base_impulse": {"force": (10.0, 100.0), "torque": (10.0, 50.0)},
+        "hand_impulse": {"force": (10.0, 50.0), "torque": (0.0, 0.0)},
+      },
+      "cooldown_steps": 100 * 24,  # 100 iterations.
+    },
+  )
 
   cfg.observations["critic"].terms["foot_height"].params[
     "asset_cfg"
@@ -130,7 +188,6 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # Arm joints are driven by the arm command, so they are excluded from the
   # default-pose regularizers (pose, stand_still) below.
-  cfg.rewards["arm_joint_vel"].params["asset_cfg"].joint_names = G1_ARM_JOINT_NAMES
   cfg.rewards["pose"].params["asset_cfg"].joint_names = G1_NON_ARM_JOINT_REGEX
   cfg.rewards["stand_still"].params["asset_cfg"].joint_names = (
     r"^(?!.*(shoulder|elbow|wrist|hip_pitch|knee|ankle_pitch)).*$"
@@ -218,6 +275,8 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
+    cfg.events.pop("base_impulse", None)
+    cfg.events.pop("hand_impulse", None)
     cfg.curriculum = {}
     cfg.events["randomize_terrain"] = EventTermCfg(
       func=envs_mdp.randomize_terrain,
