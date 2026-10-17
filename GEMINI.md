@@ -13,6 +13,7 @@
 - **Clean Code**: Write like a principal engineer. Comments are short and say only what the code cannot show (the why). No long explanations, no restating the code.
 - **Artifacts**: Prefer visuals (architecture/flow diagrams, tables, charts) over prose. Use paragraphs only when a visual cannot carry the point.
 - **Documentation & Code Integrity**: Preserve all existing comments, docstrings, and configurations unless explicit changes are requested.
+- **Reward Kernel vs. Command Limits**: For any `exp(-error_sq/std**2)`-style tracking reward paired with a clipped/P-controlled command (e.g. `arm_max_vel`, `arm_kp` in `wbc_arm`), keep `std` sized to the command's actual achievable error range, including its saturated value. A `std` too tight relative to the command's clip limit makes the reward saturate to ~0 from the first step, killing the gradient for the entire training run with no error in logs or code to flag it — check this whenever adding or tuning a new P-controlled tracking term.
 
 ## Token Conservation Mode
 
