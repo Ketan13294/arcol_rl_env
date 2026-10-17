@@ -324,7 +324,7 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     "track_arm_joint_vel": RewardTermCfg(
       func=mdp.track_arm_joint_vel,
       weight=1.0,
-      params={"command_name": "twist", "std": 0.5},
+      params={"command_name": "twist", "std": 1.0},
     ),
     "arm_joint_vel": RewardTermCfg(
       func=mdp.arm_joint_vel_penalty,

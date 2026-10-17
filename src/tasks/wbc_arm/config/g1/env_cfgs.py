@@ -131,6 +131,10 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # high-level planner's job (arm links are excluded from self-collision above).
   twist_cmd.arm_range_scale = 1.0
   twist_cmd.arm_limit_margin = 0.8
+  # Lowered from the 1.5/0.5 defaults: the tracking reward's std=1.0 kernel
+  # saturated to ~0 whenever the P-controller pinned at the old max_vel.
+  twist_cmd.arm_max_vel = 0.5
+  twist_cmd.arm_command_prob = 0.35
   # Heavier proximal joints get lower gains; light wrists respond faster.
   twist_cmd.arm_kp = {
     r".*_shoulder_(pitch|roll)_joint": 3.0,
