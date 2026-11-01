@@ -9,7 +9,7 @@ INSTALL_REQUIRES = [
     "mujoco-warp==3.5.0",
     "scipy>=1.15.0",
     "warp-lang==1.12.0",
-    "wandb",
+    "wandb<0.25",  # rsl_rl passes Settings(start_method=...), removed in 0.25.
 ]
 
 # Installation operation

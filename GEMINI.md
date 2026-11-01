@@ -26,7 +26,7 @@ When operating in this workspace, strictly conserve tokens and resources:
 
 ### Minimal Verification Ladder
 
-Prefix commands with `conda run -n unitree_rl_mjlab`, since the default shell has no `mjlab`. Run the lowest level that covers the change, and stop there. Go up a level only if the change needs it or a lower level fails. Never start full training runs (`start_train.sh`, `num-envs=4096`) for verification.
+Prefix commands with `conda run -n arcol_rl`, since the default shell has no `mjlab`. Run the lowest level that covers the change, and stop there. Go up a level only if the change needs it or a lower level fails. Never start full training runs (`start_train.sh`, `num-envs=4096`) for verification.
 
 1. **Syntax** (any `.py` edit): `python -m py_compile <changed_files>`
 2. **Registration/import** (task config, MDP term, or `__init__.py` edit):

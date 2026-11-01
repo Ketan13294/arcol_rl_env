@@ -19,7 +19,7 @@
 ## 2. Tech Stack & Dependencies
 
 ### Python Environment
-- **Python**: 3.11 (Conda environment: `unitree_rl_mjlab`)
+- **Python**: 3.11 (Conda environment: `arcol_rl`)
 - **Physics Engine**: `mujoco==3.5.0`, `mujoco-warp==3.5.0`
 - **Simulation Framework**: `mjlab==1.2.0`, `warp-lang==1.12.0`
 - **Reinforcement Learning**: `rsl-rl` (PPO runner)
@@ -137,7 +137,7 @@ The WBC implementation in `src/tasks/wbc/` extends basic velocity tracking to su
 Activate the dedicated conda environment:
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate unitree_rl_mjlab
+conda activate arcol_rl
 ```
 
 ### Launching Training
