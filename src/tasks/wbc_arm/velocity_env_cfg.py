@@ -323,8 +323,14 @@ def make_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "track_arm_joint_vel": RewardTermCfg(
       func=mdp.track_arm_joint_vel,
-      weight=1.0,
-      params={"command_name": "twist", "std": 1.0},
+      weight=0.5,
+      # Wide enough to survive exploration noise in joint velocity.
+      params={"command_name": "twist", "std": 0.75},
+    ),
+    "track_arm_joint_pos": RewardTermCfg(
+      func=mdp.track_arm_joint_pos,
+      weight=1.5,
+      params={"command_name": "twist", "std": 0.5},
     ),
     "arm_joint_vel": RewardTermCfg(
       func=mdp.arm_joint_vel_penalty,

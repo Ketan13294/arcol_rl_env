@@ -555,6 +555,20 @@ def track_arm_joint_vel(
   return torch.exp(-error_sq / std**2)
 
 
+def track_arm_joint_pos(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  std: float,
+) -> torch.Tensor:
+  """Gaussian kernel on the mean squared arm joint position error to the arm target."""
+  command_term = env.command_manager.get_term(command_name)
+  if command_term.num_arm_joints == 0:
+    return torch.zeros(env.num_envs, device=env.device)
+  q = command_term.robot.data.joint_pos[:, command_term.arm_joint_ids]
+  err_sq = torch.mean(torch.square(command_term.arm_q_target - q), dim=-1)
+  return torch.exp(-err_sq / std**2)
+
+
 # Action-space terms index actions by actuator id; this assumes the joint position
 # action term spans all robot actuators (actuator_names=(".*",)) in entity order.
 def arm_action_rate_penalty(

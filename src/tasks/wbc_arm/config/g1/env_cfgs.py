@@ -173,7 +173,7 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "track_linear_velocity",
         "track_angular_velocity",
         "track_linear_velocity_z",
-        "track_arm_joint_vel",
+        "track_arm_joint_pos",
       ),
       "events": {
         "base_impulse": {"force": (10.0, 100.0), "torque": (10.0, 50.0)},
