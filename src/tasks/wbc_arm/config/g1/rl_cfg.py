@@ -1,5 +1,7 @@
 """RL configuration for Unitree G1 velocity task."""
 
+from dataclasses import fields
+
 from mjlab.rl import (
   RslRlModelCfg,
   RslRlOnPolicyRunnerCfg,
@@ -51,4 +53,14 @@ def unitree_g1_split_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   cfg = unitree_g1_ppo_runner_cfg()
   cfg.actor.class_name = "src.tasks.wbc_arm.rl.split_actor:SplitMLPModel"
   cfg.experiment_name = "g1_wbc_split"
+  return cfg
+
+
+def unitree_g1_supermimic_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """Split actor trained by SuperMimic; `supermimic` holds the world-model hyperparameters."""
+  from src.tasks.wbc_arm.supermimic.config import SuperMimicRunnerCfg
+
+  split = unitree_g1_split_ppo_runner_cfg()
+  cfg = SuperMimicRunnerCfg(**{f.name: getattr(split, f.name) for f in fields(split)})
+  cfg.experiment_name = "g1_wbc_supermimic"
   return cfg

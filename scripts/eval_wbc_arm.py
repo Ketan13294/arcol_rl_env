@@ -19,6 +19,7 @@ from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 TASK_BY_EXPERIMENT = {
   "g1_wbc": "Unitree-G1-Flat-WBC-ARM",
   "g1_wbc_split": "Unitree-G1-Flat-WBC-ARM-Split",
+  "g1_wbc_supermimic": "Unitree-G1-Flat-WBC-ARM-SuperMimic",
 }
 FIELDS = (
   "iteration", "falls_per_env", "err_xy", "err_yaw", "err_vz", "err_height",

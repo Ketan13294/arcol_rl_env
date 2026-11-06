@@ -332,3 +332,13 @@ def unitree_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     twist_cmd.ranges.lin_pos_z = (0.5, G1_MAX_BASE_HEIGHT)
 
   return cfg
+
+
+def unitree_g1_flat_supermimic_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Flat WBC-ARM env whose push event also flags pushed envs for the world-model fit."""
+  from src.tasks.wbc_arm.supermimic.mirror import push_by_setting_velocity_flagged
+
+  cfg = unitree_g1_flat_env_cfg(play=play)
+  if "push_robot" in cfg.events:
+    cfg.events["push_robot"].func = push_by_setting_velocity_flagged
+  return cfg
