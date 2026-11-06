@@ -38,12 +38,32 @@ NUM_ENVS=8192
 #   --agent.max-iterations=100000 \
 #   --agent.resume=True
 
+# SuperMimic (world model + BPTT) on the split actor. 4096 envs as in the paper; one
+# iteration = 24 env steps + 10 model/policy updates. Warm start is a copy of the split WarmStart.
+# taskset -c "$CPU_CORES" python scripts/train.py Unitree-G1-Flat-WBC-ARM-SuperMimic \
+#   --env.scene.num-envs=4096 \
+#   --agent.run_name=SuperMimic \
+#   --agent.load_run=2026-11-01_17-44-10_WarmStart \
+#   --agent.load_checkpoint=model_225000.pt \
+#   --agent.max-iterations=20000 \
+#   --agent.save-interval=500 \
+#   --agent.resume=True
+
 # Warm start made by scripts/convert_split_ckpt.py from g1_wbc ArmPosKernelCont/model_225000.pt.
+# taskset -c "$CPU_CORES" python scripts/train.py Unitree-G1-Flat-WBC-ARM-Split \
+#   --env.scene.num-envs=$NUM_ENVS \
+#   --agent.run_name=SplitWarmStart \
+#   --agent.load_run=2026-11-01_17-44-10_WarmStart \
+#   --agent.load_checkpoint=model_225000.pt \
+#   --agent.max-iterations=50000 \
+#   --agent.save-interval=500 \
+#   --agent.resume=True
+# Wrist pitch/yaw action scale 0.075 -> 0.439; checkpoint carried over by scripts/rescale_action_ckpt.py.
 taskset -c "$CPU_CORES" python scripts/train.py Unitree-G1-Flat-WBC-ARM-Split \
   --env.scene.num-envs=$NUM_ENVS \
-  --agent.run_name=SplitWarmStart \
-  --agent.load_run=2026-11-01_17-44-10_WarmStart \
-  --agent.load_checkpoint=model_225000.pt \
-  --agent.max-iterations=50000 \
+  --agent.run_name=WristScaleCont \
+  --agent.load_run=2026-11-05_05-09-10_WristScale \
+  --agent.load_checkpoint=model_274999.pt \
+  --agent.max-iterations=25000 \
   --agent.save-interval=500 \
   --agent.resume=True
