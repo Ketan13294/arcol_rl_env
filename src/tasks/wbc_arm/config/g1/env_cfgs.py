@@ -112,7 +112,16 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   assert isinstance(joint_pos_action, JointPositionActionCfg)
   # Waist roll/pitch are locked (±0.005 rad in g1.xml): zero action scale holds them at
   # default while keeping the 29-dim action/obs layout; they skip limit penalty and bias.
-  joint_pos_action.scale = {**G1_ACTION_SCALE, "waist_pitch_joint": 0.0, "waist_roll_joint": 0.0}
+  # Wrist pitch/yaw default to 0.075 (weak 4010 motors), so a 1 rad target needs |a| ~ 13 and
+  # caps arm tracking; give them the wrist-roll scale. Old checkpoints: scripts/rescale_action_ckpt.py.
+  wrist_scale = G1_ACTION_SCALE[".*_wrist_roll_joint"]
+  joint_pos_action.scale = {
+    **G1_ACTION_SCALE,
+    ".*_wrist_pitch_joint": wrist_scale,
+    ".*_wrist_yaw_joint": wrist_scale,
+    "waist_pitch_joint": 0.0,
+    "waist_roll_joint": 0.0,
+  }
   unlocked = r"^(?!waist_(roll|pitch)_joint$).*$"
   cfg.events["encoder_bias"].params["asset_cfg"] = SceneEntityCfg("robot", joint_names=(unlocked,))
   cfg.rewards["joint_pos_limits"].params["asset_cfg"] = SceneEntityCfg("robot", joint_names=(unlocked,))
