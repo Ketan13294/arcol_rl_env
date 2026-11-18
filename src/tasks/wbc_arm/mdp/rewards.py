@@ -421,6 +421,11 @@ class variable_posture:
 
   Tune std values per joint based on how much motion that joint needs at each
   speed. Map joint name patterns to std values, e.g. {".*knee.*": 0.35}.
+
+  The regime std is then scaled by the height target, piecewise linear in two
+  segments: 1 at rest height, std_scale_low at the lowest target and
+  std_scale_high at the highest. Otherwise a held crouch is scored like a bad
+  standing pose and the policy drifts back up.
   """
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
@@ -457,6 +462,19 @@ class variable_posture:
     )
     self.std_running = torch.tensor(std_running, device=env.device, dtype=torch.float32)
 
+    def scale(key: str) -> torch.Tensor:
+      out = torch.ones(len(joint_names), device=env.device)
+      if data := cfg.params.get(key):
+        ids, _, values = resolve_matching_names_values(data, joint_names)
+        out[ids] = torch.tensor(values, device=env.device)
+      return out
+
+    self.scale_low = scale("std_scale_low")
+    self.scale_high = scale("std_scale_high")
+    twist = env.command_manager.get_term(cfg.params["command_name"])
+    self.h_low, self.h_high = twist.cfg.ranges.lin_pos_z
+    self.h_rest = twist.cfg.rest_height
+
   def __call__(
     self,
     env: ManagerBasedRlEnv,
@@ -469,8 +487,10 @@ class variable_posture:
     height_threshold: float = 0.1,
     walking_threshold: float = 0.5,
     running_threshold: float = 1.5,
+    std_scale_low: dict | None = None,
+    std_scale_high: dict | None = None,
   ) -> torch.Tensor:
-    del std_height, std_standing, std_walking, std_running  # Unused.
+    del std_height, std_standing, std_walking, std_running, std_scale_low, std_scale_high  # Unused.
 
     asset: Entity = env.scene[asset_cfg.name]
     command = env.command_manager.get_command(command_name)
@@ -495,6 +515,10 @@ class variable_posture:
       + self.std_walking * walking_mask.unsqueeze(1)
       + self.std_running * running_mask.unsqueeze(1)
     )
+    h = env.command_manager.get_term(command_name).height_target.unsqueeze(1)
+    down = ((self.h_rest - h) / (self.h_rest - self.h_low)).clamp(0.0, 1.0)
+    up = ((h - self.h_rest) / (self.h_high - self.h_rest)).clamp(0.0, 1.0)
+    std = std * (1.0 + down * (self.scale_low - 1.0) + up * (self.scale_high - 1.0))
 
     current_joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
     desired_joint_pos = self.default_joint_pos[:, asset_cfg.joint_ids]

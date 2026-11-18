@@ -270,6 +270,15 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     r".*waist_pitch.*": 0.1,
   }
 
+  # Crouched at 0.55-0.60 m the pose reward was 0.24 vs 0.91 standing, so held
+  # low targets lost to standing up; these scales lift it to ~0.6.
+  cfg.rewards["pose"].params["std_scale_low"] = {
+    r".*hip_pitch.*": 2.0,
+    r".*knee.*": 2.0,
+    r".*ankle_pitch.*": 2.5,
+  }
+  cfg.rewards["pose"].params["std_scale_high"] = {}
+
   cfg.rewards["body_orientation_l2"].params["asset_cfg"].body_names = ("torso_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("torso_link",)
   # cfg.rewards["foot_swing_height"].params["asset_cfg"].site_names = site_names

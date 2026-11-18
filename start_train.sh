@@ -61,9 +61,9 @@ NUM_ENVS=8192
 # Wrist pitch/yaw action scale 0.075 -> 0.439; checkpoint carried over by scripts/rescale_action_ckpt.py.
 taskset -c "$CPU_CORES" python scripts/train.py Unitree-G1-Flat-WBC-ARM-Split \
   --env.scene.num-envs=$NUM_ENVS \
-  --agent.run_name=WristScaleCont \
-  --agent.load_run=2026-11-05_05-09-10_WristScale \
-  --agent.load_checkpoint=model_274999.pt \
+  --agent.run_name=HeightPoseStd \
+  --agent.load_run=2026-11-05_05-09-59_WristScaleCont \
+  --agent.load_checkpoint=model_296500.pt \
   --agent.max-iterations=25000 \
   --agent.save-interval=500 \
   --agent.resume=True
