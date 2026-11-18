@@ -34,6 +34,16 @@ class PlayConfig:
   viewer: Literal["auto", "native", "viser"] = "auto"
   no_terminations: bool = False
   """Disable all termination conditions (useful for viewing motions with dummy agents)."""
+  arm_sine: bool = False
+  """WBC-ARM: drive every arm joint along a phase-shifted sinusoid and resample a random base velocity."""
+  arm_sine_period: float = 20.0
+  """Sinusoid period (s). Shoulders span ~2 rad, so short periods outrun the 0.5 rad/s arm command."""
+  arm_sine_amplitude: float = 0.8
+  """Fraction of each joint's safe half-range."""
+  plots: bool = True
+  """Viser, WBC-ARM: live plots of arm joints and base velocity/height, commanded vs actual."""
+  base_vel_interval: float = 4.0
+  """Seconds between random base-velocity commands (drawn from the play command ranges)."""
 
   # Internal flag used by demo script.
   _demo_mode: tyro.conf.Suppress[bool] = False
@@ -91,6 +101,112 @@ def _ensure_wbc_lin_vel_z_command(env_cfg: Any) -> None:
       "WBC command config must include all four commands: "
       f"{', '.join(required_commands)}."
     )
+
+
+SPLIT_ACTOR = "src.tasks.wbc_arm.rl.split_actor:SplitMLPModel"
+
+
+def _match_actor_to_checkpoint(agent_cfg: Any, ckpt: Path) -> None:
+  """Split and monolithic WBC-ARM actors share obs/action layouts; pick the one the checkpoint holds."""
+  keys = torch.load(ckpt, map_location="cpu", weights_only=False)["actor_state_dict"].keys()
+  is_split = any(k.startswith("mlp.lower.") for k in keys)
+  if is_split != (agent_cfg.actor.class_name == SPLIT_ACTOR):
+    agent_cfg.actor.class_name = SPLIT_ACTOR if is_split else "MLPModel"
+    print(f"[INFO]: Checkpoint holds a {'split' if is_split else 'monolithic'} actor; using {agent_cfg.actor.class_name}")
+
+
+class ArmSineDemo:
+  """Wraps a policy and rewrites the twist command before each step."""
+
+  def __init__(self, env: RslRlVecEnvWrapper, policy, cfg: PlayConfig):
+    u = env.unwrapped
+    self.t = u.command_manager.get_term("twist")
+    if getattr(self.t, "num_arm_joints", 0) == 0:
+      raise ValueError("--arm-sine needs a WBC-ARM task (twist command with arm joints).")
+    self.policy, self.cfg, self.dt = policy, cfg, u.step_dt
+    self.center = (self.t.safe_arm_q_min + self.t.safe_arm_q_max) / 2.0
+    self.half = cfg.arm_sine_amplitude * (self.t.safe_arm_q_max - self.t.safe_arm_q_min) / 2.0
+    n = self.t.num_arm_joints
+    self.phase = 2.0 * torch.pi * torch.arange(n, device=u.device) / n
+    self.step = 0
+
+  def __call__(self, obs) -> torch.Tensor:
+    t, r = self.t, self.t.cfg.ranges
+    time_s = self.step * self.dt
+    # Re-applied every step: an env reset resamples these flags.
+    t.time_left[:] = 1e9
+    t.is_standing_env[:] = False
+    t.is_heading_env[:] = False
+    t.is_height_env[:] = False
+    t.vz_rate[:] = 0.0
+    angle = 2.0 * torch.pi * time_s / self.cfg.arm_sine_period + self.phase
+    t.arm_q_target[:] = self.center + self.half * torch.sin(angle)
+    if self.step % max(1, round(self.cfg.base_vel_interval / self.dt)) == 0:
+      for i, rng in enumerate((r.lin_vel_x, r.lin_vel_y, r.ang_vel_z)):
+        t.vel_command_b[:, i].uniform_(*rng)
+    self.step += 1
+    return self.policy(obs)
+
+
+class TelemetryPlots:
+  """Wraps a policy and plots arm joints (target vs actual) and base velocity in the viser GUI."""
+
+  def __init__(self, env: RslRlVecEnvWrapper, policy, server, history_s: float = 10.0, every: int = 5):
+    import numpy as np
+    import viser
+
+    self.np, self.policy, self.every = np, policy, every
+    u = env.unwrapped
+    self.t, self.robot, self.dt = u.command_manager.get_term("twist"), u.scene["robot"], u.step_dt
+    self.n = int(history_s / self.dt)
+    names = self.t.arm_joint_names
+    self.sides = [[i for i, n in enumerate(names) if n.startswith(s)] for s in ("left", "right")]
+    self.buf = {k: np.full((self.n, d), np.nan) for k, d in (("q", len(names)), ("q_t", len(names)), ("v", 4), ("v_c", 4), ("h", 2))}
+    self.x = (np.arange(self.n) - self.n + 1) * self.dt
+    self.step = 0
+    colors = ("#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6")
+    scales = {"x": viser.uplot.Scale(time=False, auto=False, range=(float(self.x[0]), 0.0)), "y": viser.uplot.Scale(auto=True)}
+
+    def pair_series(labels):
+      out = [viser.uplot.Series(label="t (s)")]
+      for c, lab in zip(colors, labels):
+        out += [viser.uplot.Series(label=lab, stroke=c, width=2), viser.uplot.Series(label=f"{lab} cmd", stroke=c, width=1, dash=[6, 4])]
+      return tuple(out)
+
+    def plot(title, series):
+      return server.gui.add_uplot(
+        data=(self.x,) + tuple(np.full(self.n, np.nan) for _ in series[1:]),
+        series=series, scales=scales, title=title, aspect=1.6,
+      )
+
+    with server.gui.add_folder("Plots"):
+      self.env_idx = server.gui.add_number("Env", initial_value=0, min=0, max=u.num_envs - 1, step=1)
+      self.arm_plots = [
+        plot(f"{side} arm joints (rad)", pair_series([names[i].removeprefix(f"{side}_").removesuffix("_joint") for i in ids]))
+        for side, ids in zip(("left", "right"), self.sides)
+      ]
+      self.vel_plot = plot("Base velocity (m/s, rad/s)", pair_series(("vx", "vy", "yaw rate", "vz")))
+      self.h_plot = plot("Base height (m)", pair_series(("height",)))
+
+  def __call__(self, obs) -> torch.Tensor:
+    actions = self.policy(obs)
+    i, t, d = int(self.env_idx.value), self.t, self.robot.data
+    v = torch.cat([t.lin_vel_heading()[i, :2], d.root_link_ang_vel_b[i, 2:3], d.root_link_lin_vel_w[i, 2:3]])
+    new = {
+      "q": d.joint_pos[i, t.arm_joint_ids], "q_t": t.arm_q_target[i], "v": v, "v_c": t.command[i, :4],
+      "h": torch.stack([t.base_height()[i], t.height_target[i]]),
+    }
+    for k, val in new.items():
+      self.buf[k] = self.np.roll(self.buf[k], -1, axis=0)
+      self.buf[k][-1] = val.detach().cpu().numpy()
+    self.step += 1
+    if self.step % self.every == 0:
+      b = self.buf
+      for p, ids in zip(self.arm_plots, self.sides):
+        p.data = (self.x,) + tuple(col for j in ids for col in (b["q"][:, j], b["q_t"][:, j]))
+      self.vel_plot.data = (self.x,) + tuple(col for j in range(4) for col in (b["v"][:, j], b["v_c"][:, j]))
+      self.h_plot.data = (self.x, b["h"][:, 0], b["h"][:, 1])
+    return actions
 
 
 def run_play(task_id: str, cfg: PlayConfig):
@@ -208,12 +324,16 @@ def run_play(task_id: str, cfg: PlayConfig):
 
       policy = PolicyRandom()
   else:
+    _match_actor_to_checkpoint(agent_cfg, resume_path)
     runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
     runner = runner_cls(env, asdict(agent_cfg), device=device)
     runner.load(
       str(resume_path), load_cfg={"actor": True}, strict=True, map_location=device
     )
     policy = runner.get_inference_policy(device=device)
+
+  if cfg.arm_sine:
+    policy = ArmSineDemo(env, policy, cfg)
 
   # Handle "auto" viewer selection.
   if cfg.viewer == "auto":
@@ -226,7 +346,14 @@ def run_play(task_id: str, cfg: PlayConfig):
   if resolved_viewer == "native":
     NativeMujocoViewer(env, policy).run()
   elif resolved_viewer == "viser":
-    ViserPlayViewer(env, policy).run()
+    server = None
+    cm = env.unwrapped.command_manager
+    if cfg.plots and "twist" in cm.active_terms and getattr(cm.get_term("twist"), "num_arm_joints", 0) > 0:
+      import viser
+
+      server = viser.ViserServer(label="mjlab")
+      policy = TelemetryPlots(env, policy, server)
+    ViserPlayViewer(env, policy, viser_server=server).run()
   else:
     raise RuntimeError(f"Unsupported viewer backend: {resolved_viewer}")
 
