@@ -174,6 +174,21 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "asset_cfg": SceneEntityCfg("robot", body_names=("left_wrist_yaw_link", "right_wrist_yaw_link")),
     },
   )
+  # Whole-episode load at each palm site (0.08 m along the wrist yaw link), within 10 deg
+  # of straight down. Off until the tracking gate promotes it.
+  cfg.events["palm_load"] = EventTermCfg(
+    func=mdp.palm_load,
+    mode="step",
+    params={
+      "magnitude_range": (0.0, 0.0),
+      "cone_deg": 10.0,
+      "body_point_offset": (0.08, 0.0, 0.0),
+      "impulse_term": "hand_impulse",
+      "asset_cfg": SceneEntityCfg(
+        "robot", body_names=("left_wrist_yaw_link", "right_wrist_yaw_link")
+      ),
+    },
+  )
   cfg.curriculum["disturbance"] = CurriculumTermCfg(
     func=mdp.tracking_gated_disturbance,
     params={
@@ -187,6 +202,7 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "events": {
         "base_impulse": {"force": (10.0, 100.0), "torque": (10.0, 50.0)},
         "hand_impulse": {"force": (10.0, 50.0), "torque": (0.0, 0.0)},
+        "palm_load": {"magnitude": (10.0, 50.0)},
       },
       "cooldown_steps": 100 * 24,  # 100 iterations.
     },
@@ -299,6 +315,7 @@ def unitree_g1_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.events.pop("push_robot", None)
     cfg.events.pop("base_impulse", None)
     cfg.events.pop("hand_impulse", None)
+    cfg.events.pop("palm_load", None)
     cfg.curriculum = {}
     cfg.events["randomize_terrain"] = EventTermCfg(
       func=envs_mdp.randomize_terrain,

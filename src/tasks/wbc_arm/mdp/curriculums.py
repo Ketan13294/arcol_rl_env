@@ -121,6 +121,7 @@ class tracking_gated_disturbance:
   every cap by `increment`, restarts the cooldown and clears the score, so the gate
   is re-earned at the new level.
   Caps are force/torque norms: components are sampled in ±cap/√3, so |F| <= cap.
+  A "magnitude" cap (palm_load) instead sets magnitude_range = (start, cap).
   """
 
   def __init__(self, cfg, env: ManagerBasedRlEnv):
@@ -163,11 +164,14 @@ class tracking_gated_disturbance:
       for name, caps in events.items():
         params = env.event_manager.get_term_cfg(name).params
         for key, (start, cap) in caps.items():
-          c = min(start + (self._level - 1) * increment, cap) / 3**0.5
-          params[f"{key}_range"] = (-c, c)
+          c = min(start + (self._level - 1) * increment, cap)
+          params[f"{key}_range"] = (start, c) if key == "magnitude" else (-c / 3**0.5, c / 3**0.5)
 
     out = {"level": torch.tensor(float(self._level)), "score": self._score.clone()}
     for name in events:
       params = env.event_manager.get_term_cfg(name).params
-      out[f"{name}_force_cap"] = torch.tensor(params["force_range"][1] * 3**0.5)
+      if "magnitude_range" in params:
+        out[f"{name}_magnitude_cap"] = torch.tensor(params["magnitude_range"][1])
+      else:
+        out[f"{name}_force_cap"] = torch.tensor(params["force_range"][1] * 3**0.5)
     return out
